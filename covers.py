@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import struct
 import uuid
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -83,6 +85,15 @@ class CoverCandidate:
     date: str | None = None         # "YYYY" или "YYYY-MM-DD"
     tracks: int | None = None       # количество треков (если есть)
     release_url: str | None = None  # ссылка на страницу релиза
+    width: int | None = None        # ширина полноразмерной обложки в пикселях
+    height: int | None = None       # высота полноразмерной обложки в пикселях
+
+    @property
+    def resolution_str(self) -> str:
+        """Возвращает строку вида '1425×1425' или пустую строку, если размеры не определены."""
+        if self.width and self.height:
+            return f"{self.width}×{self.height}"
+        return ""
 
 
 # ── Сходство и ранжирование кандидатов ────────────────────────────────────────
@@ -300,6 +311,8 @@ def _search_yandex_covers(
             date=cand_date,
             tracks=alb.get("trackCount"),
             release_url=release_url,
+            width=1000,
+            height=1000,
         )
         candidates.append(candidate)
         log.debug("  ← yandex: %s — %s (%s)", candidate.artist, candidate.title, candidate.date or "—")
@@ -546,6 +559,9 @@ def search_covers(
         log.warning("Поиск обложек: для '%s — %s' не найдено релевантных обложек", artist, album)
         return []
 
+    # Обогащаем кандидатов информацией о разрешении полноразмерных обложек
+    all_candidates = enrich_candidates_dimensions(all_candidates)
+
     # Ранжируем кандидатов по баллам и группируем по тирам релевантности
     scored_candidates = [(score_cover_candidate(c, artist, album), c) for c in all_candidates]
     scored_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -561,18 +577,205 @@ def search_covers(
         "Найдено %d релевантных кандидатов для '%s — %s' (топ: %d)",
         len(result), artist, album, len(high_tier)
     )
+    for i, c in enumerate(result[:6]):
+        log.info("  #%d [%s] %s — %s", i + 1, c.source, c.resolution_str or "—", c.title)
     return result
+
+
+# ── Определение разрешения обложек ──────────────────────────────────────────
+
+def parse_image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Извлекает размеры (width, height) из первых байт заголовка изображения.
+
+    Поддерживает форматы JPEG, PNG, WebP и GIF без внешних зависимостей.
+    """
+    if not data:
+        return None
+
+    # PNG
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+
+    # GIF
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        return struct.unpack("<HH", data[6:10])
+
+    # JPEG
+    if data.startswith(b"\xff\xd8"):
+        i = 2
+        while i < len(data) - 9:
+            if data[i] != 0xff:
+                i += 1
+                continue
+            marker = data[i + 1]
+            # Маркеры Start of Frame (SOF0 - SOF15, исключая DHT 0xc4, JPG 0xc8, DAC 0xcc)
+            if marker in (0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf):
+                h, w = struct.unpack(">HH", data[i + 5 : i + 9])
+                return (w, h)
+            if marker in (0xd9, 0xda):  # EOI или SOS
+                break
+            if i + 4 > len(data):
+                break
+            length = struct.unpack(">H", data[i + 2 : i + 4])[0]
+            if length < 2:
+                break
+            i += 2 + length
+
+    # WebP
+    if data.startswith(b"RIFF") and len(data) >= 30 and data[8:12] == b"WEBP":
+        vp8_type = data[12:16]
+        if vp8_type == b"VP8 ":
+            w, h = struct.unpack("<HH", data[26:30])
+            return (w & 0x3fff, h & 0x3fff)
+        elif vp8_type == b"VP8L":
+            b0, b1, b2, b3 = data[21:25]
+            w = 1 + (((b1 & 0x3f) << 8) | b0)
+            h = 1 + (((b3 & 0xf) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
+            return (w, h)
+        elif vp8_type == b"VP8X":
+            w = 1 + struct.unpack("<I", data[24:27] + b"\x00")[0]
+            h = 1 + struct.unpack("<I", data[27:30] + b"\x00")[0]
+            return (w, h)
+
+    return None
+
+
+def infer_dimensions_from_url(url: str, source: str) -> tuple[int, int] | None:
+    """Мгновенно извлекает разрешение из структуры URL источника без сетевых запросов."""
+    if not url:
+        return None
+    if source == "yandex" or "1000x1000" in url:
+        return (1000, 1000)
+    m_dz = re.search(r"/(\d+)x0-", url)
+    if m_dz:
+        dim = int(m_dz.group(1))
+        return (dim, dim)
+    w = re.search(r"/w:(\d+)", url)
+    h = re.search(r"/h:(\d+)", url)
+    if w and h:
+        return (int(w.group(1)), int(h.group(1)))
+    m_tid = re.search(r"/(\d+)x(\d+)\.", url)
+    if m_tid:
+        return (int(m_tid.group(1)), int(m_tid.group(2)))
+    if source == "spotify":
+        if "000082c1" in url:
+            return (1425, 1425)
+        elif "0000b273" in url:
+            return (640, 640)
+    return None
+
+
+def probe_image_dimensions(url: str, timeout: float = 2.0) -> tuple[int, int] | None:
+    """Определяет разрешение изображения, читая первые несколько килобайт потока."""
+    if not url:
+        return None
+    headers = {
+        "User-Agent": _BROWSER_UA,
+        "Range": "bytes=0-65535",
+        "Accept": "image/*,*/*;q=0.8",
+    }
+    try:
+        with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
+            if r.status_code not in (200, 206):
+                return None
+            chunk = b""
+            for c in r.iter_content(chunk_size=16384):
+                chunk += c
+                dim = parse_image_dimensions(chunk)
+                if dim:
+                    return dim
+                if len(chunk) > 131072:
+                    break
+    except Exception:
+        pass
+    return None
+
+
+DEFAULT_SOURCE_DIMENSIONS: dict[str, tuple[int, int]] = {
+    "tidal": (1425, 1425),
+    "amazonmusic": (1425, 1425),
+    "spotify": (1425, 1425),
+    "deezer": (1400, 1400),
+    "yandex": (1000, 1000),
+    "musicbrainz": (1200, 1200),
+    "discogs": (600, 600),
+}
+
+
+def enrich_candidates_dimensions(
+    candidates: list[CoverCandidate],
+) -> list[CoverCandidate]:
+    """Обогащает список кандидатов информацией о разрешении оригинала (width, height).
+
+    Использует многопоточную проверку заголовков с таймаутом и фолбэк на эвристики URL.
+    """
+    if not candidates:
+        return []
+
+    resolved: dict[str, tuple[int, int]] = {}
+    urls_to_probe: set[str] = set()
+
+    for c in candidates:
+        if c.width and c.height:
+            resolved[c.big_url] = (c.width, c.height)
+            continue
+        inferred = infer_dimensions_from_url(c.big_url, c.source)
+        if inferred:
+            resolved[c.big_url] = inferred
+        else:
+            urls_to_probe.add(c.big_url)
+
+    if urls_to_probe:
+        probe_list = list(urls_to_probe)
+        with ThreadPoolExecutor(max_workers=min(16, len(probe_list))) as pool:
+            probe_results = dict(zip(probe_list, pool.map(probe_image_dimensions, probe_list)))
+        for u, dim in probe_results.items():
+            if dim:
+                resolved[u] = dim
+
+    enriched: list[CoverCandidate] = []
+    for c in candidates:
+        dim = resolved.get(c.big_url) or DEFAULT_SOURCE_DIMENSIONS.get(c.source, (0, 0))
+        if dim and dim != (0, 0) and (not c.width or not c.height):
+            enriched.append(replace(c, width=dim[0], height=dim[1]))
+        else:
+            enriched.append(c)
+
+    return enriched
+
+
+def _candidate_quality_key(c: CoverCandidate) -> tuple[int, int, int]:
+    """Ключ для ранжирования кандидатов по качеству (разрешению).
+
+    1. Общая площадь в пикселях (w * h)
+    2. Минимальная сторона (гарантия отсутствия вытянутых баннеров)
+    3. Вес источника при одинаковом разрешении
+    """
+    w = c.width or 0
+    h = c.height or 0
+    area = w * h
+    min_side = min(w, h)
+    source_weights = {
+        "tidal": 60,
+        "amazonmusic": 55,
+        "deezer": 50,
+        "spotify": 40,
+        "yandex": 30,
+        "musicbrainz": 20,
+        "discogs": 10,
+    }
+    src_weight = source_weights.get(c.source, 0)
+    return (area, min_side, src_weight)
 
 
 def reorder_candidates_round_robin(
     candidates: list[CoverCandidate],
     sources: tuple[str, ...],
 ) -> list[CoverCandidate]:
-    """Упорядочивает кандидатов методом Round-Robin по источникам.
+    """Упорядочивает кандидатов методом Round-Robin по источникам с сортировкой по качеству.
 
-    Сначала идут первые (лучшие) обложки от каждого доступного источника,
-    затем вторые, и т.д. Если один сервис вернул меньше обложек, слоты
-    следующих раундов заполняются оставшимися кандидатами от других сервисов.
+    В каждом батче (раунде) берётся по одному кандидату от каждого доступного источника,
+    а между собой кандидаты внутри батча отсортированы по убыванию качества (разрешения).
     """
     by_source: dict[str, list[CoverCandidate]] = {s: [] for s in sources}
     other: list[CoverCandidate] = []
@@ -583,15 +786,23 @@ def reorder_candidates_round_robin(
         else:
             other.append(c)
 
+    # Внутри каждого источника предварительно сортируем варианты по убыванию качества
+    for s in by_source:
+        by_source[s].sort(key=_candidate_quality_key, reverse=True)
+
     ordered: list[CoverCandidate] = []
     max_len = max([len(v) for v in by_source.values()] + [0])
 
     for round_idx in range(max_len):
-        for s in sources:
-            if round_idx < len(by_source[s]):
-                ordered.append(by_source[s][round_idx])
+        round_cands = [by_source[s][round_idx] for s in sources if round_idx < len(by_source[s])]
+        # Сортируем кандидатов текущего раунда (батча) между собой по убыванию качества
+        round_cands.sort(key=_candidate_quality_key, reverse=True)
+        ordered.extend(round_cands)
 
-    ordered.extend(other)
+    if other:
+        other.sort(key=_candidate_quality_key, reverse=True)
+        ordered.extend(other)
+
     return ordered
 
 

@@ -58,6 +58,19 @@ CJK_META_RE = re.compile(
 )
 
 
+def extract_featured_artists(title: str) -> list[str]:
+    """Извлекает имена приглашённых артистов из скобок feat/ft/with в названии трека."""
+    if not title:
+        return []
+    m = re.search(r"(?i)[\(\[](?:feat\.?|ft\.?|with)\s+([^()\[\]]+)[\)\]]", title)
+    if not m:
+        m = re.search(r"(?i)\s+(?:feat\.?|ft\.?)\s+(.+)$", title)
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    return [a.strip() for a in re.split(r"[,;&]|\s+(?:and|и|x)\s+", raw, flags=re.I) if a.strip()]
+
+
 def clean_track_title(t: str) -> str:
     """Удаляет номера треков, префиксы, feat/ft/with/remastered/explicit/etc."""
     t = re.sub(r"^\d+[\s\.\-_]+", "", t or "")
@@ -123,7 +136,12 @@ class LyricManager:
         headers = {"User-Agent": self.BROWSER_UA}
 
         clean_t = clean_track_title(title)
+        title_feats = extract_featured_artists(title)
         artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
+        for f_art in title_feats:
+            if not any(f_art.lower() == a.lower() for a in artist_tokens):
+                artist_tokens.append(f_art)
+
         first_art = artist_tokens[0] if artist_tokens else artist
 
         log.info("Поиск текстов [LRCLIB]: '%s — %s'", artist, title)
@@ -135,6 +153,8 @@ class LyricManager:
         ]
         if clean_t != title:
             exact_trials.insert(1, {"artist_name": artist, "track_name": clean_t, "album_name": album})
+        if len(artist_tokens) >= 2:
+            exact_trials.insert(1, {"artist_name": first_art, "track_name": f"{clean_t} (feat. {artist_tokens[1]})", "album_name": album})
 
         for exact_params in exact_trials:
             params = {k: v for k, v in exact_params.items() if v}
@@ -173,12 +193,15 @@ class LyricManager:
         # Шаг 2: Мягкий поиск по ключевым словам
         target_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", clean_t).strip()
         expanded_queries = []
-        if first_art:
-            expanded_queries.append(f"{first_art} {clean_t}")
+        # Если есть приглашённые артисты — СНАЧАЛА ищем полный состав (с фитами), чтобы не скачать урезанную версию!
         if len(artist_tokens) >= 2:
             expanded_queries.append(f"{artist_tokens[0]} {artist_tokens[1]} {clean_t}")
-        if f"{artist} {clean_t}" not in expanded_queries:
             expanded_queries.append(f"{artist} {clean_t}")
+            expanded_queries.append(f"{artist_tokens[0]} feat. {artist_tokens[1]} {clean_t}")
+        if first_art:
+            q_first = f"{first_art} {clean_t}"
+            if q_first not in expanded_queries:
+                expanded_queries.append(q_first)
         if clean_t != title and f"{first_art} {title}" not in expanded_queries:
             expanded_queries.append(f"{first_art} {title}")
         if target_base and target_base != clean_t:
@@ -215,8 +238,13 @@ class LyricManager:
                         log.info("  LRCLIB: получено записей: %d", len(data))
                         target_clean = clean_track_title(title).lower()
                         target_base_clean = clean_track_title(target_base).lower()
+
+                        cand_synced_list = []
+                        cand_plain_list = []
+
                         for item in data:
                             api_title = item.get("trackName", "")
+                            api_art = item.get("artistName", "")
                             api_title_clean = clean_track_title(api_title).lower()
                             api_base_clean = clean_track_title(re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", api_title)).lower()
 
@@ -238,15 +266,49 @@ class LyricManager:
 
                             synced = clean_lrc_metadata(item.get("syncedLyrics"))
                             plain = clean_lrc_metadata(item.get("plainLyrics"))
+
+                            # Оценка наличия фитов в кандидате
+                            has_feat = False
+                            if len(artist_tokens) >= 2:
+                                cand_all = (api_art + " " + api_title).lower()
+                                for f_art in artist_tokens[1:]:
+                                    if f_art.lower() in cand_all:
+                                        has_feat = True
+                                        break
+
                             if synced:
-                                log.info("  ✓ LRCLIB: выбрано караоке для '%s'", api_title)
+                                cand_synced_list.append((has_feat, synced, plain, api_title))
+                            if plain:
+                                cand_plain_list.append((has_feat, plain, api_title))
+
+                        # Если искали трек с фитом, приоритет отдаём кандидатам с фитом
+                        if len(artist_tokens) >= 2:
+                            feat_synced = [c for c in cand_synced_list if c[0]]
+                            if feat_synced:
+                                _, s_txt, p_txt, a_t = feat_synced[0]
+                                log.info("  ✓ LRCLIB: выбрано караоке с фитом для '%s'", a_t)
                                 return (
-                                    LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist),
-                                    LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist) if plain else None,
+                                    LyricResult(text=s_txt, is_synced=True, source="lrclib", track_title=title, artist=artist),
+                                    LyricResult(text=p_txt, is_synced=False, source="lrclib", track_title=title, artist=artist) if p_txt else None,
                                 )
-                            if plain and not best_plain:
-                                log.info("  ✓ LRCLIB: найден обычный текст для '%s'", api_title)
-                                best_plain = LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist)
+                            feat_plain = [c for c in cand_plain_list if c[0]]
+                            if feat_plain and not best_plain:
+                                _, p_txt, a_t = feat_plain[0]
+                                log.info("  ✓ LRCLIB: найден текст с фитом для '%s'", a_t)
+                                best_plain = LyricResult(text=p_txt, is_synced=False, source="lrclib", track_title=title, artist=artist)
+
+                        if cand_synced_list:
+                            _, s_txt, p_txt, a_t = cand_synced_list[0]
+                            log.info("  ✓ LRCLIB: выбрано караоке для '%s'", a_t)
+                            return (
+                                LyricResult(text=s_txt, is_synced=True, source="lrclib", track_title=title, artist=artist),
+                                LyricResult(text=p_txt, is_synced=False, source="lrclib", track_title=title, artist=artist) if p_txt else None,
+                            )
+                        if cand_plain_list and not best_plain:
+                            _, p_txt, a_t = cand_plain_list[0]
+                            log.info("  ✓ LRCLIB: найден обычный текст для '%s'", a_t)
+                            best_plain = LyricResult(text=p_txt, is_synced=False, source="lrclib", track_title=title, artist=artist)
+
                         if best_plain:
                             return None, best_plain
             except Exception as e:
@@ -269,7 +331,12 @@ class LyricManager:
             return re.sub(r"[^\w]", "", (s or "").lower())
 
         clean_t = clean_track_title(title)
+        title_feats = extract_featured_artists(title)
         artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
+        for f_art in title_feats:
+            if not any(f_art.lower() == a.lower() for a in artist_tokens):
+                artist_tokens.append(f_art)
+
         expanded_tokens = []
         for a in artist_tokens:
             if a not in expanded_tokens:
@@ -293,10 +360,13 @@ class LyricManager:
             if q and q not in queries:
                 queries.append(q)
 
+        # Сначала ищем по полному составу с фитами, чтобы получить полную версию текста
+        if len(expanded_tokens) >= 2:
+            add_query(f"{expanded_tokens[0]} {expanded_tokens[1]} {clean_t}")
+            add_query(f"{artist} {clean_t}")
+            add_query(f"{expanded_tokens[0]} feat. {expanded_tokens[1]} {clean_t}")
         if expanded_tokens:
             add_query(f"{expanded_tokens[0]} {clean_t}")
-            if len(expanded_tokens) >= 2:
-                add_query(f"{expanded_tokens[0]} {expanded_tokens[1]} {clean_t}")
         add_query(f"{artist} {clean_t}")
         if clean_t != title and expanded_tokens:
             add_query(f"{expanded_tokens[0]} {title}")
@@ -433,6 +503,13 @@ class LyricManager:
 
             score += matched_arts * 30
 
+            # Бонус за полное совпадение всех соавторов / фитов и защита от версии без фитов
+            if len(clean_target_arts) >= 2:
+                if matched_arts == len(clean_target_arts):
+                    score += 40
+                elif matched_arts == 1:
+                    score -= 20
+
             if score > best_score:
                 best_score = score
                 best_hit = res
@@ -505,9 +582,15 @@ class LyricManager:
 
         log.info("Поиск караоке [lrcmux]: '%s — %s'", artist_clean, title_clean)
 
-        target_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title_clean).strip()
+        clean_t = clean_track_title(title_clean)
+        target_norm = re.sub(r"[^\w]", "", clean_t.lower())
+        target_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", clean_t).strip()
+        target_base_norm = re.sub(r"[^\w]", "", target_base.lower())
+
         queries = [title_clean]
-        if target_base and target_base != title_clean:
+        if clean_t and clean_t != title_clean:
+            queries.append(clean_t)
+        if target_base and target_base not in queries:
             queries.append(target_base)
 
         for q_title in queries:
@@ -527,6 +610,19 @@ class LyricManager:
                 )
                 if r.status_code == 200:
                     data = r.json()
+                    # Валидация заголовка ответа API (если сервис вернул title)
+                    api_title = data.get("title", "")
+                    if api_title:
+                        c_clean = clean_track_title(api_title).lower()
+                        c_norm = re.sub(r"[^\w]", "", c_clean)
+                        if (
+                            c_norm != target_norm
+                            and (not target_base_norm or c_norm != target_base_norm)
+                            and SequenceMatcher(None, target_norm, c_norm).ratio() < 0.7
+                        ):
+                            log.warning("  ⚠️ lrcmux вернул трек '%s' вместо '%s' — отклонено", api_title, title)
+                            continue
+
                     lines = data.get("lines", [])
                     if lines:
                         out = []
@@ -544,6 +640,19 @@ class LyricManager:
                                 out.append(txt)
 
                         full_text = clean_lrc_metadata("\n".join(out))
+
+                        # Валидация тегов внутри текста LRC ([ti:...])
+                        ti_m = re.search(r"\[ti:\s*(.+?)\]", full_text, re.I)
+                        if ti_m:
+                            ti_found = re.sub(r"[^\w]", "", clean_track_title(ti_m.group(1)).lower())
+                            if (
+                                ti_found != target_norm
+                                and (not target_base_norm or ti_found != target_base_norm)
+                                and SequenceMatcher(None, target_norm, ti_found).ratio() < 0.7
+                            ):
+                                log.warning("  ⚠️ lrcmux LRC содержит заголовок [ti:%s] вместо '%s' — отклонено", ti_m.group(1), title)
+                                continue
+
                         if full_text:
                             log.info("  ✓ lrcmux: получено %d строк (%s)", len(lines), "караоке" if has_sync else "plain")
                             return LyricResult(
@@ -564,22 +673,32 @@ class LyricManager:
     # ── 4. SyncedLyrics (NetEase, Megalobiz, Musixmatch) ─────────────────────
 
     def _fetch_syncedlyrics(self, artist: str, title: str) -> LyricResult | None:
-        """Ищет синхронизированный караоке-текст через провайдеры syncedlyrics."""
+        """Ищет синхронизированный караоке-текст через провайдеры syncedlyrics с валидацией названия трека."""
         search_query = f"{artist} {title}".strip()
         if not search_query:
             return None
 
         log.info("Поиск караоке [SyncedLyrics]: '%s — %s'", artist, title)
 
-        target_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title).strip()
+        clean_t = clean_track_title(title)
+        target_norm = re.sub(r"[^\w]", "", clean_t.lower())
+        target_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", clean_t).strip()
+        target_base_norm = re.sub(r"[^\w]", "", target_base.lower())
+
+        target_base_full = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title).strip()
         queries = [search_query]
-        if target_base and target_base != title:
-            base_q = f"{artist} {target_base}".strip()
+        if target_base_full and target_base_full != title:
+            base_q = f"{artist} {target_base_full}".strip()
             if base_q not in queries:
                 queries.append(base_q)
+        if clean_t and clean_t != title:
+            cl_q = f"{artist} {clean_t}".strip()
+            if cl_q not in queries:
+                queries.append(cl_q)
 
         try:
             import syncedlyrics
+            import syncedlyrics.utils
             from syncedlyrics.providers.base import TimeoutSession
 
             # Увеличиваем таймаут подключения до 5 секунд для надёжной связи с зарубежными базами
@@ -589,20 +708,82 @@ class LyricManager:
 
             TimeoutSession.request = _custom_timeout_request
 
-            # Ищем исключительно синхронизированный текст (с таймкодами)
-            for q in queries:
-                log.info("  Запрос SyncedLyrics: '%s'", q)
-                lrc_text = syncedlyrics.search(q, synced_only=True)
-                if lrc_text and has_timestamps(lrc_text):
-                    cleaned_lrc = clean_lrc_metadata(lrc_text)
-                    log.info("  ✓ SyncedLyrics: получено караоке (%d строк)", len(cleaned_lrc.splitlines()))
-                    return LyricResult(
-                        text=cleaned_lrc,
-                        is_synced=True,
-                        source="syncedlyrics",
-                        track_title=title,
-                        artist=artist,
-                    )
+            # Перехватываем get_best_match в syncedlyrics, чтобы отсечь треки с другими названиями
+            orig_get_best_match = syncedlyrics.utils.get_best_match
+
+            def _strict_get_best_match(results, search_term, compare_key="name", min_score=65):
+                valid = []
+                for r in results:
+                    c_title = ""
+                    if isinstance(r, dict):
+                        if "track" in r and isinstance(r["track"], dict):
+                            c_title = r["track"].get("track_name", "")
+                        elif "name" in r:
+                            c_title = r.get("name", "")
+                        elif "trackName" in r:
+                            c_title = r.get("trackName", "")
+                        elif "title" in r:
+                            c_title = r.get("title", "")
+                    elif hasattr(r, "get_text"):
+                        c_title = r.get_text()
+
+                    if c_title:
+                        c_clean = clean_track_title(c_title).lower()
+                        c_norm = re.sub(r"[^\w]", "", c_clean)
+                        c_base_norm = re.sub(r"[^\w]", "", re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", c_clean).strip())
+                        matched = (
+                            c_norm == target_norm
+                            or (target_base_norm and c_base_norm == target_base_norm)
+                            or (target_norm in c_norm if len(target_norm) >= 4 else False)
+                            or (c_norm in target_norm if len(c_norm) >= 4 else False)
+                            or SequenceMatcher(None, target_norm, c_norm).ratio() >= 0.75
+                            or (
+                                target_base_norm
+                                and c_base_norm
+                                and SequenceMatcher(None, target_base_norm, c_base_norm).ratio() >= 0.75
+                            )
+                        )
+                        if not matched:
+                            continue
+                    valid.append(r)
+
+                if not valid:
+                    return None
+                return orig_get_best_match(valid, search_term, compare_key=compare_key, min_score=min_score)
+
+            syncedlyrics.utils.get_best_match = _strict_get_best_match
+            try:
+                for q in queries:
+                    log.info("  Запрос SyncedLyrics: '%s'", q)
+                    lrc_text = syncedlyrics.search(q, synced_only=True)
+                    if lrc_text and has_timestamps(lrc_text):
+                        # Проверка [ti:...] в тексте LRC
+                        ti_m = re.search(r"\[ti:\s*(.+?)\]", lrc_text, re.I)
+                        if ti_m:
+                            ti_found = re.sub(r"[^\w]", "", clean_track_title(ti_m.group(1)).lower())
+                            if (
+                                ti_found != target_norm
+                                and (not target_base_norm or ti_found != target_base_norm)
+                                and SequenceMatcher(None, target_norm, ti_found).ratio() < 0.75
+                            ):
+                                log.warning(
+                                    "  ⚠️ SyncedLyrics LRC содержит [ti:%s] вместо '%s' — отклонено",
+                                    ti_m.group(1),
+                                    title,
+                                )
+                                continue
+
+                        cleaned_lrc = clean_lrc_metadata(lrc_text)
+                        log.info("  ✓ SyncedLyrics: получено караоке (%d строк)", len(cleaned_lrc.splitlines()))
+                        return LyricResult(
+                            text=cleaned_lrc,
+                            is_synced=True,
+                            source="syncedlyrics",
+                            track_title=title,
+                            artist=artist,
+                        )
+            finally:
+                syncedlyrics.utils.get_best_match = orig_get_best_match
         except Exception as e:
             log.debug("syncedlyrics error for '%s — %s': %s", artist, title, e)
 
@@ -620,6 +801,13 @@ class LyricManager:
         preferred_source: str | None = None,
     ) -> LyricResult | None:
         """Выполняет поиск текста по каскаду или по указанному источнику."""
+        # Обогащаем список артистов фитами из названия трека, если они там указаны
+        title_feats = extract_featured_artists(title)
+        if title_feats:
+            current_tokens = [a.strip().lower() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
+            missing_feats = [f for f in title_feats if f.lower() not in current_tokens]
+            if missing_feats:
+                artist = f"{artist}, {', '.join(missing_feats)}"
         # 1. Точечный поиск по выбранному сервису
         if preferred_source == "lrclib":
             synced, plain = self._fetch_lrclib(artist, title, album, duration)
@@ -709,11 +897,18 @@ class LyricManager:
 
         try:
             audio = FLAC(str(path))
-            arts = audio.get("artist", [])
-            artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
+            arts = [a.strip() for a in audio.get("artist", []) if a.strip()]
             title = audio.get("title", [""])[0]
             album = audio.get("album", [""])[0]
             duration = int(audio.info.length) if hasattr(audio.info, "length") else 0
+
+            # Дополнительно извлекаем фиты из названия или имени файла, если их ещё нет в теге artist
+            title_feats = extract_featured_artists(title) or extract_featured_artists(path.stem)
+            for f_art in title_feats:
+                if not any(f_art.lower() == a.lower() for a in arts):
+                    arts.append(f_art)
+
+            artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
 
             if not artist or not title:
                 return "Нет тегов ❌"

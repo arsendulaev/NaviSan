@@ -469,7 +469,8 @@ def apply_cover(
         _apply_date_to_flacs(folder, cover.date)
         date_note = f", дата {cover.date} → теги"
 
-    return f"🖼️ Обложка [{cover.source}]{date_note}"
+    res_note = f" ({cover.resolution_str})" if cover.resolution_str else ""
+    return f"🖼️ Обложка [{cover.source}]{res_note}{date_note}"
 
 
 def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
@@ -508,7 +509,8 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
         except Exception as e:
             log.warning("Не удалось обновить обложку в %s: %s", f.name, e)
 
-    return f"🖼️ Обложка [{cover.source}] успешно вшита в {len(flacs)} треков"
+    res_note = f" ({cover.resolution_str})" if cover.resolution_str else ""
+    return f"🖼️ Обложка [{cover.source}]{res_note} успешно вшита в {len(flacs)} треков"
 
 
 def apply_pipeline(

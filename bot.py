@@ -161,6 +161,8 @@ async def _send_native_slideshow(
     for i, c in enumerate(display):
         global_idx = start_idx + i
         caption_parts = [f"#{global_idx + 1} · [{c.source}]"]
+        if c.resolution_str:
+            caption_parts.append(f"· {c.resolution_str}")
         if c.date:
             caption_parts.append(f"({c.date})")
         if c.tracks:
@@ -178,12 +180,13 @@ async def _send_native_slideshow(
             },
         })
 
-    # Кнопки с номерами и названиями источников (по 2 в ряд)
+    # Кнопки с номерами, названиями источников и разрешением (по 2 в ряд)
     buttons = []
     for i, c in enumerate(display):
         global_idx = start_idx + i
+        res_part = f" ({c.resolution_str})" if c.resolution_str else ""
         buttons.append(
-            InlineKeyboardButton(f"{global_idx + 1}. {c.source}", callback_data=f"cover:pick:{global_idx}")
+            InlineKeyboardButton(f"{global_idx + 1}. {c.source}{res_part}", callback_data=f"cover:pick:{global_idx}")
         )
 
     keyboard = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
@@ -341,7 +344,8 @@ async def _on_new_release(folder: Path, app: Application, is_recover: bool = Fal
         chosen = candidates[0] if candidates else None
         session.chosen_cover = chosen
         session.state = SessionState.PROCESSING
-        cover_info = f"обложка #{1} [{chosen.source}]" if chosen else "без обложки"
+        res_info = f" ({chosen.resolution_str})" if (chosen and chosen.resolution_str) else ""
+        cover_info = f"обложка #{1} [{chosen.source}]{res_info}" if chosen else "без обложки"
         proc_msg = await app.bot.send_message(
             chat_id=OWNER_ID,
             text=f"⚙️ *Автоматическая обработка релиза ({cover_info}):*\n🎵 {artist} — {album}",
@@ -453,9 +457,10 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
         # Режим /cover (замена обложки в Library):
         if session.is_recover:
+            res_note = f" ({chosen.resolution_str})" if chosen.resolution_str else ""
             status_msg = await ctx.bot.send_message(
                 chat_id=OWNER_ID,
-                text=f"⏳ Скачиваю обложку #{idx + 1} [{chosen.source}] и вшиваю в треки…"
+                text=f"⏳ Скачиваю обложку #{idx + 1} [{chosen.source}]{res_note} и вшиваю в треки…"
             )
             loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(
@@ -684,7 +689,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         SessionState.PROCESSING: "⚙️ Обработка",
         SessionState.DONE: "✅ Завершено",
     }
-    cover_info = session.chosen_cover.source if session.chosen_cover else "не выбрана"
+    cover_res = f" ({session.chosen_cover.resolution_str})" if (session.chosen_cover and session.chosen_cover.resolution_str) else ""
+    cover_info = f"{session.chosen_cover.source}{cover_res}" if session.chosen_cover else "не выбрана"
 
     await update.message.reply_text(
         f"📂 Папка: `{session.folder.name}`\n"
@@ -725,16 +731,18 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"{i + 1}. `{d.name}` — {display} ({n} треков)")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"scan:{i}"))
 
+    lines.append("\n💬 _Напиши имя папки в чат для быстрого поиска._")
     ctx.bot_data["scan_folders"] = folders
     ctx.bot_data["scan_cmd_msg_id"] = update.message.message_id
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
     keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="scan:close")])
 
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    ctx.bot_data[f"active_menu_{OWNER_ID}"] = {"cmd": "scan", "msg_id": sent_msg.message_id}
 
 
 async def on_scan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -747,6 +755,7 @@ async def on_scan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     # Закрытие меню выбора папки
     if query.data == "scan:close":
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
         try:
             await query.delete_message()
         except Exception:
@@ -758,6 +767,8 @@ async def on_scan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             except Exception:
                 pass
         return
+
+    ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
 
     folders = ctx.bot_data.get("scan_folders", [])
     _, payload = query.data.split(":", 1)
@@ -835,16 +846,18 @@ async def cmd_cover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"{i + 1}. `{d.name}` — {display}")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"recover:{i}"))
 
+    lines.append("\n💬 _Напиши название релиза в чат для быстрого поиска._")
     ctx.bot_data["recover_folders"] = matches
     ctx.bot_data["cover_cmd_msg_id"] = update.message.message_id
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
     keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="recover:close")])
 
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    ctx.bot_data[f"active_menu_{OWNER_ID}"] = {"cmd": "cover", "msg_id": sent_msg.message_id}
 
 
 async def on_recover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -857,6 +870,7 @@ async def on_recover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
     # Закрытие меню
     if query.data == "recover:close":
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
         try:
             await query.delete_message()
         except Exception:
@@ -868,6 +882,8 @@ async def on_recover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 pass
         return
+
+    ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
 
     folders = ctx.bot_data.get("recover_folders", [])
     _, payload = query.data.split(":", 1)
@@ -974,7 +990,8 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"💿 Режим: *{target_desc}*\n\n"
         "*Выбери режим идеализации:*\n\n"
         "• ▶️ *Обычный (мягкий)* — быстро заполнит только пропуски: найдет недостающие обложки, недостающие тексты и проставит ReplayGain. Существующие файлы не перезаписывает.\n\n"
-        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора (извлечёт фиты из названий), перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain."
+        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора (извлечёт фиты из названий), перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain.\n\n"
+        "💬 _Напиши название альбома в чат для фильтрации апгрейда._"
     )
 
     keyboard = [
@@ -983,12 +1000,13 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("❌ Отмена", callback_data="upgrade:close")],
     ]
 
-    await ctx.bot.send_message(
+    sent_msg = await ctx.bot.send_message(
         chat_id=OWNER_ID,
         text=text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    ctx.bot_data[f"active_menu_{OWNER_ID}"] = {"cmd": "upgrade", "msg_id": sent_msg.message_id}
 
 
 async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1003,11 +1021,15 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     action = parts[1]
 
     if action == "close":
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
         try:
             await query.delete_message()
         except Exception:
             pass
         return
+
+    if action == "start":
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
 
     if action == "stop":
         ctx.bot_data["upgrade_cancelled"] = True
@@ -1283,6 +1305,7 @@ def _render_albums_menu(matches: list[Path]) -> tuple[str, list[list[InlineKeybo
         lines.append(f"{i + 1}. `{d.name}` — {display}")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"lyrics:alb:{i}"))
 
+    lines.append("\n💬 _Напиши название релиза в чат для быстрого поиска._")
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
     keyboard.append([InlineKeyboardButton("📊 Аудит текстов библиотеки", callback_data="lyrics:audit")])
     keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")])
@@ -1396,11 +1419,12 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.bot_data["lyrics_cmd_msg_id"] = update.message.message_id
     ctx.bot_data.pop("lyrics_from_report", None)
     text, keyboard = _render_albums_menu(matches)
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    ctx.bot_data[f"active_menu_{OWNER_ID}"] = {"cmd": "lyrics", "msg_id": sent_msg.message_id}
 
 
 # ── Настройка артистов (Artist UI) ───────────────────────────────────────────
@@ -1675,17 +1699,19 @@ async def cmd_artist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"{i + 1}. `{d.name}` — {display}")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:alb:{i}"))
 
+    lines.append("\n💬 _Напиши название релиза в чат для быстрого поиска._")
     ctx.bot_data["artist_albums"] = matches
     ctx.bot_data["artist_cmd_msg_id"] = update.message.message_id
     ctx.bot_data.pop("artist_from_report", None)
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
     keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
 
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    ctx.bot_data[f"active_menu_{OWNER_ID}"] = {"cmd": "artist", "msg_id": sent_msg.message_id}
 
 
 async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1700,6 +1726,7 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "close":
         await query.answer()
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
         if f"artist_action_{OWNER_ID}" in ctx.bot_data:
             del ctx.bot_data[f"artist_action_{OWNER_ID}"]
         try:
@@ -1713,6 +1740,9 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
         return
+
+    if action in ("alb", "album"):
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
 
     if action == "album":
         await query.answer()
@@ -2010,6 +2040,8 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     waiting_lyrics = f"lyrics_waiting_{OWNER_ID}"
     waiting_artist = f"artist_action_{OWNER_ID}"
+    active_menu = f"active_menu_{OWNER_ID}"
+    ctx.bot_data.pop(active_menu, None)
 
     cancelled = False
     if waiting_lyrics in ctx.bot_data:
@@ -2051,6 +2083,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer()
 
     if action == "close":
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
         try:
             await query.delete_message()
         except Exception:
@@ -2062,6 +2095,9 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
         return
+
+    if action in ("alb", "album", "audit"):
+        ctx.bot_data.pop(f"active_menu_{OWNER_ID}", None)
 
     if action == "audit":
         status_text = "⏳ Анализирую тексты по всей библиотеке..."
@@ -2080,6 +2116,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         ])
         matches = all_albums[-10:]
         ctx.bot_data["lyrics_albums"] = matches
+        ctx.bot_data[f"active_menu_{OWNER_ID}"] = {"cmd": "lyrics", "msg_id": query.message.message_id}
         text, keyboard = _render_albums_menu(matches)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -2663,6 +2700,274 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         )
         delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=3.0)
         return
+
+    # 3. Интерактивный поиск по тексту для активного меню (/cover, /lyrics, /artist, /upgrade, /scan)
+    active_menu_key = f"active_menu_{OWNER_ID}"
+    if active_menu_key in ctx.bot_data and update.message.text:
+        menu_info = ctx.bot_data[active_menu_key]
+        query_str = update.message.text.strip()
+        cmd_type = menu_info.get("cmd")
+        msg_id = menu_info.get("msg_id")
+
+        if cmd_type == "cover":
+            all_albums = sorted([
+                d for d in LIBRARY.iterdir()
+                if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.iterdir() if f.is_file())
+            ])
+            matches = [d for d in all_albums if query_str.lower() in d.name.lower()]
+            if len(matches) == 1:
+                ctx.bot_data.pop(active_menu_key, None)
+                try:
+                    await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=msg_id)
+                except Exception:
+                    pass
+                await _on_new_release(matches[0], ctx.application, is_recover=True)
+                return
+            elif len(matches) > 1:
+                ctx.bot_data["recover_folders"] = matches
+                lines = [f"🖼️ *Выбери альбом для смены обложки по запросу `{query_str}` ({len(matches)}):*\n"]
+                buttons = []
+                for i, d in enumerate(matches):
+                    artist, album = album_info(d)
+                    display = f"{artist} — {album}" if album else d.name
+                    lines.append(f"{i + 1}. `{d.name}` — {display}")
+                    buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"recover:{i}"))
+                lines.append("\n💬 _Напиши другое название в чат для изменения поиска._")
+                keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+                keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="recover:close")])
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text="\n".join(lines),
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+                return
+            else:
+                try:
+                    kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="recover:close")]]
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=f"❌ Ничего не найдено по запросу: `{query_str}`\n\n💬 Напиши другое название для поиска.",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                except Exception:
+                    pass
+                return
+
+        elif cmd_type == "lyrics":
+            all_albums = sorted([
+                d for d in LIBRARY.iterdir()
+                if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.iterdir() if f.is_file())
+            ])
+            matches = [d for d in all_albums if query_str.lower() in d.name.lower()]
+            if len(matches) == 1:
+                ctx.bot_data.pop(active_menu_key, None)
+                album_dir = matches[0]
+                tracks = sorted(album_dir.rglob("*.flac"))
+                ctx.bot_data["lyrics_tracks"] = tracks
+                ctx.bot_data["lyrics_album_path"] = album_dir
+                ctx.bot_data.pop("lyrics_from_report", None)
+                text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=False)
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+                return
+            elif len(matches) > 1:
+                ctx.bot_data["lyrics_albums"] = matches
+                text, keyboard = _render_albums_menu(matches)
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+                return
+            else:
+                try:
+                    kb = [
+                        [InlineKeyboardButton("📊 Аудит текстов библиотеки", callback_data="lyrics:audit")],
+                        [InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")],
+                    ]
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=f"❌ Ничего не найдено по запросу: `{query_str}`\n\n💬 Напиши другое название для поиска.",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                except Exception:
+                    pass
+                return
+
+        elif cmd_type == "artist":
+            all_albums = sorted([
+                d for d in LIBRARY.iterdir()
+                if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.iterdir() if f.is_file())
+            ])
+            matches = [d for d in all_albums if query_str.lower() in d.name.lower()]
+            if len(matches) == 1:
+                ctx.bot_data.pop(active_menu_key, None)
+                album_dir = matches[0]
+                ctx.bot_data["artist_tracks"] = sorted(album_dir.rglob("*.flac"))
+                ctx.bot_data["artist_album_path"] = album_dir
+                ctx.bot_data.pop("artist_from_report", None)
+                text, keyboard = _render_album_artists_view(album_dir, from_report=False)
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+                return
+            elif len(matches) > 1:
+                ctx.bot_data["artist_albums"] = matches
+                lines = [f"👤 *Выбери альбом для настройки артистов по запросу `{query_str}` ({len(matches)}):*\n"]
+                buttons = []
+                for i, d in enumerate(matches):
+                    artist, album = album_info(d)
+                    display = f"{artist} — {album}" if album else d.name
+                    lines.append(f"{i + 1}. `{d.name}` — {display}")
+                    buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:alb:{i}"))
+                lines.append("\n💬 _Напиши другое название в чат для изменения поиска._")
+                keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+                keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text="\n".join(lines),
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+                return
+            else:
+                try:
+                    kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")]]
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=f"❌ Ничего не найдено по запросу: `{query_str}`\n\n💬 Напиши другое название для поиска.",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                except Exception:
+                    pass
+                return
+
+        elif cmd_type == "upgrade":
+            albums = sorted([
+                d for d in LIBRARY.iterdir()
+                if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.rglob("*.flac") if f.is_file())
+            ])
+            matches = [d for d in albums if query_str.lower() in d.name.lower()]
+            if not matches:
+                try:
+                    kb = [[InlineKeyboardButton("❌ Отмена", callback_data="upgrade:close")]]
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=f"❌ В `{LIBRARY.name}` не найдено альбомов по запросу: `{query_str}`\n\n💬 Напиши другое название для фильтрации.",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                except Exception:
+                    pass
+                return
+
+            ctx.bot_data["upgrade_target_albums"] = [str(a) for a in matches]
+            target_desc = f"По запросу: `{query_str}` ({len(matches)} альбомов)"
+            text = (
+                f"📁 Каталог: `{LIBRARY.name}`\n"
+                f"💿 Режим: *{target_desc}*\n\n"
+                "*Выбери режим идеализации:*\n\n"
+                "• ▶️ *Обычный (мягкий)* — быстро заполнит только пропуски: найдет недостающие обложки, недостающие тексты и проставит ReplayGain. Существующие файлы не перезаписывает.\n\n"
+                "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора (извлечёт фиты из названий), перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain.\n\n"
+                "💬 _Напиши другое название в чат для изменения фильтра._"
+            )
+            keyboard = [
+                [InlineKeyboardButton("▶️ Обычный апгрейд", callback_data="upgrade:start:normal")],
+                [InlineKeyboardButton("⚡ Полная пересборка (Force)", callback_data="upgrade:start:force")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="upgrade:close")],
+            ]
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=OWNER_ID,
+                    message_id=msg_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            except Exception:
+                pass
+            return
+
+        elif cmd_type == "scan":
+            folders = sorted([
+                d for d in INBOX.iterdir()
+                if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.iterdir() if f.is_file())
+            ])
+            matches = [d for d in folders if query_str.lower() in d.name.lower()]
+            if not matches:
+                try:
+                    kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="scan:close")]]
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=msg_id,
+                        text=f"❌ В `{INBOX.name}` не найдено папок по запросу: `{query_str}`\n\n💬 Напиши другое название для поиска.",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                except Exception:
+                    pass
+                return
+
+            lines = [f"📥 *Папки в {INBOX.name} по запросу `{query_str}` ({len(matches)}):*\n"]
+            buttons = []
+            for i, d in enumerate(matches):
+                artist, album = album_info(d)
+                n = count_flacs(d)
+                display = f"{artist} — {album}" if album else d.name
+                lines.append(f"{i + 1}. `{d.name}` — {display} ({n} треков)")
+                buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"scan:{i}"))
+
+            lines.append("\n💬 _Напиши другое имя папки в чат для изменения поиска._")
+            ctx.bot_data["scan_folders"] = matches
+            keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+            keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="scan:close")])
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=OWNER_ID,
+                    message_id=msg_id,
+                    text="\n".join(lines),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            except Exception:
+                pass
+            return
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
