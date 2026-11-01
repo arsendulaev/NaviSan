@@ -27,6 +27,7 @@ import requests
 from dotenv import load_dotenv
 from mutagen.flac import FLAC
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -660,23 +661,28 @@ def _run_full_pipeline(session: AlbumSession) -> tuple[list[str], Path]:
 
 @_owner_only
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"Бот автоматически следит за папкой `{INBOX.name}`.\n"
-        "Когда появится новый релиз — я пришлю варианты обложек "
-        "и перенесу альбом без лишнего мусора.\n\n"
-        "*Команды:*\n"
-        f"• `/upgrade` — пакетная обработка всей папки `{LIBRARY.name}` разом\n"
-        f"• `/scan` — сканировать `{INBOX.name}` и выбрать релиз вручную\n"
-        f"• `/cover [поиск]` — сменить обложку для альбома в `{LIBRARY.name}`\n"
-        "• `/lyrics [поиск]` — превью и настройка текстов песен (.lrc)\n"
-        "• `/artist [поиск]` — проверить и настроить артистов релиза\n"
-        f"• `/process <папка>` — принудительно обработать релиз из `{INBOX.name}`\n"
-        "• `/status` — статус текущей сессии\n"
-        "• `/settings` — настройки бота (режим ReplayGain и др.)\n"
-        "• `/update` — проверить и установить обновления бота\n"
-        "• `/cancel` — отменить текущий ввод текста",
-        parse_mode="Markdown",
+    text = (
+        "🎧 *NaviSan — автопилот FLAC-библиотеки для Navidrome*\n\n"
+        f"Я непрерывно слежу за папкой `{INBOX.name}`: очищаю теги по белому списку, "
+        "лечу повреждённые FLAC-потоки, подбираю Hi-Res обложки с индикацией разрешения, "
+        "нахожу караоке-тексты (.lrc) и раскладываю всё по канонической структуре медиатеки.\n\n"
+        "*Управление и настройки:*\n"
+        "• `/settings` — режим ReplayGain (`🟢 расчёт`, `✂️ вырезать`, `⚪ пропуск`) и пакетная очистка\n"
+        "• `/update` — проверка и установка обновлений бота с GitHub в 1 клик\n"
+        "• `/status` — статус текущей сессии обработки\n"
+        "• `/cancel` — отмена текущего действия или ввода текста\n\n"
+        f"*Работа с медиатекой ({LIBRARY.name}):*\n"
+        f"• `/upgrade` — идеализация медиатеки (кнопки **Обычный** или **Smart Force**)\n"
+        f"• `/cover [поиск]` — сменить обложку альбома на Hi-Res (ранжирование по качеству)\n"
+        "• `/lyrics [поиск]` — караоке и plain тексты песен (.lrc), смена источников\n"
+        "• `/lyrics audit` — дашборд покрытия текстами всей библиотеки\n"
+        "• `/artist [поиск]` — проверка и редактирование артистов и фитов\n\n"
+        f"*Входящие ({INBOX.name}):*\n"
+        f"• `/scan` — ручное сканирование входящей папки\n"
+        f"• `/process <папка>` — принудительно запустить обработку релиза\n\n"
+        "💡 _После вызова `/cover`, `/lyrics` или `/artist` можно просто написать название релиза текстом в чат для быстрого перехода._"
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 @_owner_only
@@ -2125,6 +2131,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Управление настройками NaviSan."""
     text, markup = _build_settings_view()
     await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=3.0)
 
 
 async def on_settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2229,6 +2236,8 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Проверка и установка обновлений бота через git."""
     from updater import check_for_updates
 
+    ctx.bot_data["update_cmd_msg_id"] = update.message.message_id
+
     status_msg = await update.message.reply_text("🔍 _Проверяю наличие обновлений на GitHub…_", parse_mode="Markdown")
 
     loop = asyncio.get_running_loop()
@@ -2238,6 +2247,8 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if st == "error":
         err = info.get("error", "Неизвестная ошибка")
         await status_msg.edit_text(f"❌ *Ошибка при проверке обновлений:*\n`{err}`", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, status_msg.message_id, delay=8.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=8.0)
         return
 
     if st == "up_to_date":
@@ -2249,6 +2260,8 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"📝 _{cur.get('message', '')}_"
         )
         await status_msg.edit_text(txt, parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, status_msg.message_id, delay=7.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=7.0)
         return
 
     if st == "available":
@@ -2290,8 +2303,17 @@ async def on_update_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     from updater import perform_update, restart_process
 
-    if action == "cancel":
-        await query.answer("Обновление отменено")
+    if action in ("cancel", "snooze"):
+        from settings import load_settings, save_settings
+        settings = dict(load_settings())
+        settings["update_snooze_until"] = time.time() + 24 * 3600
+        save_settings(settings)
+
+        resp_text = "Напомню через 24 часа." if action == "snooze" else "Обновление отменено."
+        await query.answer(resp_text)
+        cmd_id = ctx.bot_data.pop("update_cmd_msg_id", None)
+        if cmd_id:
+            delete_later(ctx.bot, OWNER_ID, cmd_id, delay=0.5)
         try:
             await query.message.delete()
         except Exception:
@@ -2304,6 +2326,10 @@ async def on_update_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         ctx.bot_data["update_in_progress"] = True
+        cmd_id = ctx.bot_data.pop("update_cmd_msg_id", None)
+        if cmd_id:
+            delete_later(ctx.bot, OWNER_ID, cmd_id, delay=0.5)
+
         await query.answer("Начинаю обновление...")
 
         wait_text = (
@@ -2326,6 +2352,7 @@ async def on_update_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             err = res.get("error", "Неизвестная ошибка")
             fail_text = f"❌ *Ошибка установки обновления:*\n`{err}`"
             await _safe_edit_message(query, fail_text)
+            delete_later(ctx.bot, OWNER_ID, query.message.message_id, delay=10.0)
             return
 
         restarting_text = (
@@ -3255,6 +3282,74 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     log.error("Необработанная ошибка Telegram: %s", err, exc_info=err)
 
 
+UPDATE_CHECK_INTERVAL_SECONDS = int(os.environ.get("NAVISAN_UPDATE_CHECK_INTERVAL", 6 * 3600))
+
+
+async def auto_update_checker(app: Application) -> None:
+    """Периодическая фоновая проверка наличия новых версий на GitHub."""
+    from updater import check_for_updates
+    from settings import load_settings, save_settings
+
+    # Ждём 60 секунд после запуска бота, чтобы не мешать стартовой инициализации
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            info = await loop.run_in_executor(None, check_for_updates)
+            if info.get("status") == "available":
+                target = info.get("target", {})
+                target_sha = target.get("sha", "")
+
+                settings = dict(load_settings())
+                last_notified = settings.get("last_notified_update_sha")
+                last_notified_time = float(settings.get("last_notified_update_time", 0))
+                snooze_until = float(settings.get("update_snooze_until", 0))
+                now = time.time()
+
+                is_new_commit = bool(target_sha and target_sha != last_notified)
+                is_snooze_expired = bool(now >= snooze_until and (now - last_notified_time >= 24 * 3600))
+
+                if target_sha and (is_new_commit or is_snooze_expired):
+                    cur = info.get("current", {})
+                    commits = info.get("commits", [])
+                    cnt = info.get("count", len(commits))
+                    reqs = info.get("reqs_changed", False)
+
+                    commits_preview = "\n".join(f"• `{c}`" for c in commits[:5])
+                    if len(commits) > 5:
+                        commits_preview += f"\n_...и ещё {len(commits) - 5} коммитов_"
+
+                    req_note = "\n\n⚠️ _В обновлении затронут requirements.txt (потребуется `docker compose build`)._" if reqs else ""
+
+                    txt = (
+                        f"🔔 *Доступно обновление NaviSan!* (+{cnt} коммитов)\n\n"
+                        f"Текущая версия: `{cur.get('short')}`\n"
+                        f"Новая версия: `{target.get('short')}`\n\n"
+                        f"*Что нового:*\n{commits_preview}{req_note}\n\n"
+                        "Нажми кнопку ниже для установки и перезапуска:"
+                    )
+                    kb = [
+                        [InlineKeyboardButton("🚀 Обновить и перезапустить", callback_data="update:confirm")],
+                        [InlineKeyboardButton("⏱️ Напомнить позже", callback_data="update:snooze")],
+                    ]
+                    await app.bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=txt,
+                        reply_markup=InlineKeyboardMarkup(kb),
+                        parse_mode="Markdown",
+                    )
+                    settings["last_notified_update_sha"] = target_sha
+                    settings["last_notified_update_time"] = now
+                    settings["update_snooze_until"] = now + 24 * 3600
+                    save_settings(settings)
+                    log.info("Отправлено фоновое уведомление о новом обновлении: %s", target.get("short"))
+        except Exception as e:
+            log.warning("Ошибка в фоновой проверке обновлений: %s", e)
+
+        await asyncio.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
+
+
 async def post_init(app: Application) -> None:
     """Запускает Inbox Watcher после инициализации бота."""
     async def on_release(folder: Path) -> None:
@@ -3266,6 +3361,25 @@ async def post_init(app: Application) -> None:
 
     asyncio.create_task(watch_inbox(INBOX, on_release, is_busy=is_busy))
     log.info("Inbox watcher задача создана")
+
+    asyncio.create_task(auto_update_checker(app))
+    log.info("Фоновая проверка обновлений запущена (интервал %dс)", UPDATE_CHECK_INTERVAL_SECONDS)
+
+    try:
+        commands = [
+            BotCommand("settings", "Настройки бота (ReplayGain и др.)"),
+            BotCommand("update", "Проверить и установить обновления"),
+            BotCommand("upgrade", "Идеализация всей библиотеки"),
+            BotCommand("cover", "Сменить обложку релиза (Hi-Res)"),
+            BotCommand("lyrics", "Настройка текстов песен (.lrc)"),
+            BotCommand("artist", "Настройка артистов и фитов"),
+            BotCommand("scan", "Сканировать Inbox вручную"),
+            BotCommand("status", "Статус текущей сессии"),
+            BotCommand("cancel", "Отменить текущее действие"),
+        ]
+        await app.bot.set_my_commands(commands)
+    except Exception as e:
+        log.debug("Не удалось обновить меню BotCommand: %s", e)
 
     # Проверка, произошёл ли перезапуск после команды /update
     was_updated = False
@@ -3297,10 +3411,13 @@ async def post_init(app: Application) -> None:
                         text=upd_text,
                         parse_mode="Markdown",
                     )
+                    delete_later(app.bot, orig_chat_id, orig_msg_id, delay=8.0)
                 except Exception:
-                    await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+                    msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+                    delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
             else:
-                await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+                msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+                delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
     except Exception as e:
         log.warning("Ошибка обработки маркера обновления в post_init: %s", e)
 
