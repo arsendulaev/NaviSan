@@ -21,6 +21,8 @@ navidrome.db
 *.sqlite3
 artists_cache.json
 unknown_artists.txt
+settings.json
+.navisan_settings.json
 *.log
 
 # Audio files, covers, test data

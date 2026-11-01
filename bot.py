@@ -672,6 +672,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/artist [поиск]` — проверить и настроить артистов релиза\n"
         f"• `/process <папка>` — принудительно обработать релиз из `{INBOX.name}`\n"
         "• `/status` — статус текущей сессии\n"
+        "• `/settings` — настройки бота (режим ReplayGain и др.)\n"
         "• `/cancel` — отменить текущий ввод текста",
         parse_mode="Markdown",
     )
@@ -2069,6 +2070,158 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=3.0)
 
 
+# ── Настройки (Settings) ──────────────────────────────────────────────────────
+
+def _build_settings_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Формирует текст и разметку кнопок для экрана настроек."""
+    from settings import (
+        get_replaygain_mode,
+        RG_MODE_WRITE,
+        RG_MODE_STRIP,
+        RG_MODE_SKIP,
+        RG_MODE_DESCRIPTIONS,
+    )
+
+    current_mode = get_replaygain_mode()
+    mode_info = RG_MODE_DESCRIPTIONS.get(current_mode, {})
+    title = mode_info.get("title", current_mode)
+    desc = mode_info.get("desc", "")
+
+    text = (
+        "⚙️ *Настройки NaviSan*\n\n"
+        "🔊 *Режим ReplayGain:*\n"
+        f"Текущий статус: *{title}*\n"
+        f"_{desc}_\n\n"
+        "Нажмите на кнопку для изменения режима:"
+    )
+
+    b_write = f"{'✅ ' if current_mode == RG_MODE_WRITE else ''}🟢 Рассчитывать"
+    b_strip = f"{'✅ ' if current_mode == RG_MODE_STRIP else ''}✂️ Вырезать"
+    b_skip = f"{'✅ ' if current_mode == RG_MODE_SKIP else ''}⚪ Пропускать"
+
+    keyboard: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(b_write, callback_data=f"settings:rg:{RG_MODE_WRITE}"),
+            InlineKeyboardButton(b_strip, callback_data=f"settings:rg:{RG_MODE_STRIP}"),
+            InlineKeyboardButton(b_skip, callback_data=f"settings:rg:{RG_MODE_SKIP}"),
+        ]
+    ]
+
+    if current_mode == RG_MODE_STRIP:
+        keyboard.append([
+            InlineKeyboardButton("🧹 Вырезать RG со всей библиотеки", callback_data="settings:strip_prompt")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("❌ Закрыть", callback_data="settings:close")
+    ])
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+@_owner_only
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Управление настройками NaviSan."""
+    text, markup = _build_settings_view()
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def on_settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка нажатий на инлайн-кнопки в меню настроек."""
+    query = update.callback_query
+    if update.effective_user.id != OWNER_ID:
+        await query.answer()
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    from settings import (
+        set_replaygain_mode,
+        RG_MODE_WRITE,
+        RG_MODE_STRIP,
+        RG_MODE_SKIP,
+        RG_MODE_DESCRIPTIONS,
+    )
+    from replaygain import strip_library_replaygain
+
+    if action == "close":
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "menu":
+        await query.answer()
+        text, markup = _build_settings_view()
+        await _safe_edit_message(query, text, reply_markup=markup)
+        return
+
+    if action == "rg":
+        target_mode = parts[2] if len(parts) > 2 else ""
+        if target_mode in (RG_MODE_WRITE, RG_MODE_STRIP, RG_MODE_SKIP):
+            set_replaygain_mode(target_mode)
+            short_name = RG_MODE_DESCRIPTIONS.get(target_mode, {}).get("short", target_mode)
+            await query.answer(f"Режим изменён: {short_name}")
+            text, markup = _build_settings_view()
+            await _safe_edit_message(query, text, reply_markup=markup)
+        else:
+            await query.answer("Неизвестный режим", show_alert=True)
+        return
+
+    if action == "strip_prompt":
+        await query.answer()
+        text = (
+            "⚠️ *Удаление ReplayGain со всей библиотеки*\n\n"
+            f"Будут удалены все теги `REPLAYGAIN_*` и метаданные громкости из всех FLAC-треков в `{LIBRARY.name}`.\n\n"
+            "Вы уверены, что хотите продолжить?"
+        )
+        kb = [
+            [InlineKeyboardButton("⚠️ Да, вырезать со всех треков", callback_data="settings:strip_confirm")],
+            [InlineKeyboardButton("🔙 Отмена", callback_data="settings:menu")],
+        ]
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if action == "strip_confirm":
+        if ctx.bot_data.get("rg_stripping_running"):
+            await query.answer("Очистка уже выполняется!", show_alert=True)
+            return
+
+        ctx.bot_data["rg_stripping_running"] = True
+        await query.answer("Запускаю очистку библиотеки...")
+
+        init_text = (
+            "⏳ *Удаление ReplayGain со всех треков библиотеки…*\n\n"
+            "_Пожалуйста, подождите завершения…_"
+        )
+        await _safe_edit_message(query, init_text)
+
+        loop = asyncio.get_running_loop()
+        try:
+            summary = await loop.run_in_executor(None, lambda: strip_library_replaygain(LIBRARY))
+        except Exception as e:
+            log.error("Ошибка при пакетном удалении ReplayGain: %s", e)
+            summary = {"total_tracks": 0, "stripped_tracks": 0, "albums_affected": 0}
+        finally:
+            ctx.bot_data["rg_stripping_running"] = False
+
+        res_text = (
+            "✅ *Очистка ReplayGain успешно завершена!*\n\n"
+            f"💿 Затронуто альбомов: *{summary['albums_affected']}*\n"
+            f"🎵 Очищено треков: *{summary['stripped_tracks']}* из *{summary['total_tracks']}*\n"
+        )
+        kb = [[InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="settings:menu")]]
+        await _safe_edit_message(query, res_text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    await query.answer()
+
+
+
 async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик кнопок управления текстами и нейросетевой синхронизацией."""
     query = update.callback_query
@@ -3020,6 +3173,8 @@ def main() -> None:
     app.add_handler(CommandHandler("artist", cmd_artist))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("config", cmd_settings))
 
     # Callback-кнопки
     app.add_handler(CallbackQueryHandler(on_upgrade_callback, pattern=r"^upgrade:"))
@@ -3029,6 +3184,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_lyrics_callback, pattern=r"^lyrics:"))
     app.add_handler(CallbackQueryHandler(on_artist_callback, pattern=r"^artist:"))
     app.add_handler(CallbackQueryHandler(on_report_callback, pattern=r"^report:"))
+    app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^settings:"))
 
     # Сообщения владельца (текст или документы .lrc для ручного ввода текста песни или имени артиста)
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, on_owner_message))

@@ -103,8 +103,26 @@ class FLACSurgeon:
         "replaygain_reference_loudness",
     })
 
-    def __init__(self, sanitizer: TagSanitizer | None = None) -> None:
+    REPLAYGAIN_TAGS: frozenset[str] = frozenset({
+        "replaygain_track_gain", "replaygain_track_peak",
+        "replaygain_album_gain", "replaygain_album_peak",
+        "replaygain_reference_loudness",
+    })
+
+    def __init__(
+        self,
+        sanitizer: TagSanitizer | None = None,
+        strip_replaygain: bool | None = None,
+    ) -> None:
         self.sanitizer = sanitizer if sanitizer is not None else TagSanitizer()
+        if strip_replaygain is None:
+            try:
+                from settings import get_replaygain_mode
+                self.strip_replaygain = (get_replaygain_mode() == "strip")
+            except Exception:
+                self.strip_replaygain = False
+        else:
+            self.strip_replaygain = strip_replaygain
 
     def _embed_cover_from_file(
         self,
@@ -253,10 +271,15 @@ class FLACSurgeon:
             audio["disctotal"] = ["1"]
 
         # 1. Фильтрация по whitelist тегов и очистка мусорных значений
+        allowed_tags = (
+            self.WHITELIST - self.REPLAYGAIN_TAGS
+            if self.strip_replaygain
+            else self.WHITELIST
+        )
         saved_tags: dict[str, list[str]] = {}
         for key in list(audio.keys()):
             lower_key = key.lower()
-            if lower_key in self.WHITELIST:
+            if lower_key in allowed_tags:
                 cleaned_vals: list[str] = []
                 for v in audio[key]:
                     v_str = str(v).strip()

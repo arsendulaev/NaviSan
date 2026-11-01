@@ -584,13 +584,22 @@ def apply_pipeline(
     new_folder = Path(renamer.rename_album_folder(str(folder)))
     report.append(f"📁 `{new_folder.name}`")
 
-    # Расчёт ReplayGain (потрековый и альбомный)
-    from replaygain import apply_replaygain
-    rg_ok, rg_msg = apply_replaygain(new_folder)
-    if rg_ok:
-        report.append("🔊 ReplayGain: рассчитан (Track & Album Gain)")
+    # Расчёт / удаление ReplayGain
+    from settings import get_replaygain_mode
+    rg_mode = get_replaygain_mode()
+    if rg_mode == "strip":
+        from replaygain import remove_replaygain
+        remove_replaygain(new_folder)
+        report.append("🔇 ReplayGain: отключён (теги вырезаны)")
+    elif rg_mode == "skip":
+        report.append("⚪ ReplayGain: пропущен")
     else:
-        report.append(f"⚠️ ReplayGain: {rg_msg}")
+        from replaygain import apply_replaygain
+        rg_ok, rg_msg = apply_replaygain(new_folder)
+        if rg_ok:
+            report.append("🔊 ReplayGain: рассчитан (Track & Album Gain)")
+        else:
+            report.append(f"⚠️ ReplayGain: {rg_msg}")
 
     return report, new_folder
 
@@ -1643,14 +1652,22 @@ def upgrade_album(
     new_folder_str = renamer.rename_album_folder(str(album_dir), force_common_artists=force)
     new_folder = Path(new_folder_str)
 
-    # Шаг 5: Проверка и расчёт ReplayGain
+    # Шаг 5: Проверка и расчёт / удаление ReplayGain
     if cancel_flag and cancel_flag():
         return {"cancelled": True, "old_folder": album_dir.name, "new_folder": new_folder.name, "folder_path": new_folder}
-    from replaygain import album_has_replaygain, apply_replaygain
+    from settings import get_replaygain_mode
+    rg_mode = get_replaygain_mode()
     replaygain_added = False
-    if force_replaygain or not album_has_replaygain(new_folder):
-        rg_ok, _ = apply_replaygain(new_folder)
-        replaygain_added = rg_ok
+    if rg_mode == "strip":
+        from replaygain import remove_replaygain
+        remove_replaygain(new_folder)
+    elif rg_mode == "skip":
+        pass
+    else:
+        from replaygain import album_has_replaygain, apply_replaygain
+        if force_replaygain or not album_has_replaygain(new_folder):
+            rg_ok, _ = apply_replaygain(new_folder)
+            replaygain_added = rg_ok
 
     return {
         "old_folder": album_dir.name,

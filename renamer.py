@@ -279,14 +279,20 @@ class FileSystemManager:
             except Exception as e:
                 log.warning("Ошибка при вшивании обложки после слияния: %s", e)
 
-        # 4. Пересчёт ReplayGain для объединённого релиза
+        # 4. Пересчёт / удаление ReplayGain для объединённого релиза
         rg_ok = False
         rg_msg = ""
         try:
-            from replaygain import apply_replaygain
-            rg_ok, rg_msg = apply_replaygain(dst)
+            from settings import get_replaygain_mode
+            rg_mode = get_replaygain_mode()
+            if rg_mode == "strip":
+                from replaygain import remove_replaygain
+                remove_replaygain(dst)
+            elif rg_mode == "write":
+                from replaygain import apply_replaygain
+                rg_ok, rg_msg = apply_replaygain(dst)
         except Exception as e:
-            log.warning("Ошибка расчёта ReplayGain после слияния: %s", e)
+            log.warning("Ошибка обработки ReplayGain после слияния: %s", e)
 
         total_flacs = len(list(dst.rglob("*.flac")))
 
