@@ -103,23 +103,23 @@ def check_for_updates() -> dict[str, Any]:
 
     current = get_current_commit()
 
-    # Получаем свежие данные с GitHub
-    rc, _, err = _run_git(["fetch", "origin", "main"])
-    if rc != 0:
-        log.warning("Ошибка git fetch origin main: %s", err)
-        return {
-            "status": "error",
-            "error": f"Не удалось связаться с GitHub: {err}",
-            "current": current,
-        }
+    # 1. Получаем SHA удалённого репозитория через ls-remote (не требует записи на диск!)
+    rc, ls_out, err = _run_git(["ls-remote", "origin", "HEAD"])
+    remote_sha = ""
+    if rc == 0 and ls_out:
+        remote_sha = ls_out.split()[0].strip()
 
-    rc, remote_sha, _ = _run_git(["rev-parse", "origin/main"])
-    if rc != 0 or not remote_sha:
-        return {
-            "status": "error",
-            "error": "Не удалось определить remote хэш",
-            "current": current,
-        }
+    if not remote_sha:
+        # Фоллбэк через git fetch
+        rc_f, _, err_f = _run_git(["fetch", "origin", "main"])
+        if rc_f == 0:
+            _, remote_sha, _ = _run_git(["rev-parse", "origin/main"])
+        else:
+            return {
+                "status": "error",
+                "error": f"Не удалось связаться с GitHub: {err or err_f}",
+                "current": current,
+            }
 
     if current["sha"] == remote_sha:
         return {
@@ -128,24 +128,53 @@ def check_for_updates() -> dict[str, Any]:
         }
 
     # Есть новые коммиты
-    rc, log_out, _ = _run_git(["log", "HEAD..origin/main", "--oneline", "-n", "10"])
-    commits = [line.strip() for line in log_out.splitlines() if line.strip()]
-
-    # Проверяем, менялся ли requirements.txt
-    rc, diff_files, _ = _run_git(["diff", "--name-only", "HEAD", "origin/main"])
-    changed_files = [f.strip() for f in diff_files.splitlines() if f.strip()]
-    reqs_changed = "requirements.txt" in changed_files
-
-    _, remote_short, _ = _run_git(["rev-parse", "--short", "origin/main"])
-    _, remote_msg, _ = _run_git(["log", "-1", "--pretty=%s", "origin/main"])
-    _, remote_date, _ = _run_git(["log", "-1", "--pretty=%cd", "--date=format:%Y-%m-%d %H:%M", "origin/main"])
-
+    commits: list[str] = []
+    reqs_changed = False
     target = {
         "sha": remote_sha,
-        "short": remote_short or remote_sha[:7],
-        "message": remote_msg or "",
-        "date": remote_date or "",
+        "short": remote_sha[:7],
+        "message": "",
+        "date": "",
     }
+
+    # Пытаемся получить список коммитов локально через fetch
+    rc_f, _, _ = _run_git(["fetch", "origin", "main"])
+    if rc_f == 0:
+        rc, log_out, _ = _run_git(["log", "HEAD..origin/main", "--oneline", "-n", "10"])
+        commits = [line.strip() for line in log_out.splitlines() if line.strip()]
+        rc, diff_files, _ = _run_git(["diff", "--name-only", "HEAD", "origin/main"])
+        changed_files = [f.strip() for f in diff_files.splitlines() if f.strip()]
+        reqs_changed = "requirements.txt" in changed_files
+
+        _, remote_short, _ = _run_git(["rev-parse", "--short", "origin/main"])
+        _, remote_msg, _ = _run_git(["log", "-1", "--pretty=%s", "origin/main"])
+        _, remote_date, _ = _run_git(["log", "-1", "--pretty=%cd", "--date=format:%Y-%m-%d %H:%M", "origin/main"])
+        target["short"] = remote_short or target["short"]
+        target["message"] = remote_msg or ""
+        target["date"] = remote_date or ""
+    else:
+        # Fallback через публичный GitHub API (не требует записи в .git)
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.github.com/repos/arsendulaev/NaviSan/commits?sha=main&per_page=10",
+                headers={"User-Agent": "NaviSan"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                for item in data:
+                    c_sha = item.get("sha", "")
+                    if c_sha == current["sha"]:
+                        break
+                    c_msg = item.get("commit", {}).get("message", "").splitlines()[0]
+                    commits.append(f"{c_sha[:7]} {c_msg}")
+                if data:
+                    first = data[0]
+                    target["message"] = first.get("commit", {}).get("message", "").splitlines()[0]
+                    d_raw = first.get("commit", {}).get("author", {}).get("date", "")
+                    target["date"] = d_raw[:16].replace("T", " ") if d_raw else ""
+        except Exception as e:
+            log.warning("Не удалось получить коммиты через GitHub API: %s", e)
 
     return {
         "status": "available",
@@ -169,6 +198,12 @@ def perform_update(chat_id: int | None = None, message_id: int | None = None) ->
     rc, stdout, stderr = _run_git(["pull", "origin", "main"])
     if rc != 0:
         err = stderr or stdout or "Неизвестная ошибка git pull"
+        if "Permission denied" in err or "FETCH_HEAD" in err:
+            err = (
+                "Ошибка прав доступа к файлам на сервере (Permission denied).\n"
+                "Выполните на сервере в папке NaviSan:\n"
+                "sudo chown -R 1000:1000 ."
+            )
         log.error("Сбой git pull origin main: %s", err)
         return {
             "success": False,
