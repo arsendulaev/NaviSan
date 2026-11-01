@@ -673,6 +673,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"• `/process <папка>` — принудительно обработать релиз из `{INBOX.name}`\n"
         "• `/status` — статус текущей сессии\n"
         "• `/settings` — настройки бота (режим ReplayGain и др.)\n"
+        "• `/update` — проверить и установить обновления бота\n"
         "• `/cancel` — отменить текущий ввод текста",
         parse_mode="Markdown",
     )
@@ -2221,6 +2222,123 @@ async def on_settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
 
+# ── Самообновление (Self-Update) ──────────────────────────────────────────────
+
+@_owner_only
+async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверка и установка обновлений бота через git."""
+    from updater import check_for_updates
+
+    status_msg = await update.message.reply_text("🔍 _Проверяю наличие обновлений на GitHub…_", parse_mode="Markdown")
+
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(None, check_for_updates)
+    st = info.get("status")
+
+    if st == "error":
+        err = info.get("error", "Неизвестная ошибка")
+        await status_msg.edit_text(f"❌ *Ошибка при проверке обновлений:*\n`{err}`", parse_mode="Markdown")
+        return
+
+    if st == "up_to_date":
+        cur = info.get("current", {})
+        txt = (
+            "✨ *Установлена самая актуальная версия NaviSan!*\n\n"
+            f"🔖 Текущий коммит: `{cur.get('short', 'unknown')}`\n"
+            f"📅 Дата: {cur.get('date', '')}\n"
+            f"📝 _{cur.get('message', '')}_"
+        )
+        await status_msg.edit_text(txt, parse_mode="Markdown")
+        return
+
+    if st == "available":
+        cur = info.get("current", {})
+        target = info.get("target", {})
+        commits = info.get("commits", [])
+        cnt = info.get("count", len(commits))
+        reqs = info.get("reqs_changed", False)
+
+        commits_preview = "\n".join(f"• `{c}`" for c in commits[:8])
+        if len(commits) > 8:
+            commits_preview += f"\n_...и ещё {len(commits) - 8} коммитов_"
+
+        req_note = "\n\n⚠️ _В обновлении затронут requirements.txt (потребуется `docker compose build`)._" if reqs else ""
+
+        txt = (
+            f"🚀 *Доступно обновление NaviSan!* (+{cnt} коммитов)\n\n"
+            f"Текущая версия: `{cur.get('short')}`\n"
+            f"Новая версия: `{target.get('short')}`\n\n"
+            f"*Что нового:*\n{commits_preview}{req_note}\n\n"
+            "Нажми кнопку ниже для установки и перезапуска:"
+        )
+        kb = [
+            [InlineKeyboardButton("🚀 Обновить и перезапустить", callback_data="update:confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="update:cancel")],
+        ]
+        await status_msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+
+async def on_update_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик подтверждения обновления."""
+    query = update.callback_query
+    if update.effective_user.id != OWNER_ID:
+        await query.answer()
+        return
+
+    data = query.data or ""
+    action = data.split(":")[1] if ":" in data else ""
+
+    from updater import perform_update, restart_process
+
+    if action == "cancel":
+        await query.answer("Обновление отменено")
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "confirm":
+        if ctx.bot_data.get("update_in_progress"):
+            await query.answer("Обновление уже выполняется!", show_alert=True)
+            return
+
+        ctx.bot_data["update_in_progress"] = True
+        await query.answer("Начинаю обновление...")
+
+        wait_text = (
+            "⏳ *Скачиваю обновление с GitHub…* (`git pull origin main`)\n\n"
+            "_Пожалуйста, подожди пару секунд…_"
+        )
+        await _safe_edit_message(query, wait_text)
+
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: perform_update(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+            ),
+        )
+
+        if not res.get("success"):
+            ctx.bot_data["update_in_progress"] = False
+            err = res.get("error", "Неизвестная ошибка")
+            fail_text = f"❌ *Ошибка установки обновления:*\n`{err}`"
+            await _safe_edit_message(query, fail_text)
+            return
+
+        restarting_text = (
+            "🔄 *Обновление успешно установлено!*\n\n"
+            "Перезапускаю процесс бота… Через 2-3 секунды он снова будет онлайн."
+        )
+        await _safe_edit_message(query, restarting_text)
+
+        # Перезапуск процесса (Docker поднимет его через restart: unless-stopped)
+        restart_process(delay=1.5)
+
+
+
 
 async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик кнопок управления текстами и нейросетевой синхронизацией."""
@@ -3149,14 +3267,52 @@ async def post_init(app: Application) -> None:
     asyncio.create_task(watch_inbox(INBOX, on_release, is_busy=is_busy))
     log.info("Inbox watcher задача создана")
 
+    # Проверка, произошёл ли перезапуск после команды /update
+    was_updated = False
     try:
-        msg = await app.bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"🟢 NaviSan бот запущен. Слежу за {INBOX.name}.",
-        )
-        delete_later(app.bot, OWNER_ID, msg.message_id, delay=5.0)
-    except Exception:
-        log.warning("Не удалось отправить приветственное сообщение")
+        from updater import get_and_clear_update_marker
+        marker = get_and_clear_update_marker()
+        if marker:
+            was_updated = True
+            new_com = marker.get("new_commit", {})
+            sha = new_com.get("short", "unknown")
+            title = new_com.get("message", "")
+            req_warn = (
+                "\n\n⚠️ _Внимание: в обновлении изменился requirements.txt. "
+                "Если новым функциям нужны пакеты, выполните на сервере:_ `docker compose build`"
+                if marker.get("reqs_changed") else ""
+            )
+            upd_text = (
+                f"🟢 *NaviSan успешно обновлён и перезапущен!* 🎉\n\n"
+                f"🔖 Версия: `{sha}`\n"
+                f"📝 _{title}_{req_warn}"
+            )
+            orig_msg_id = marker.get("message_id")
+            orig_chat_id = marker.get("chat_id") or OWNER_ID
+            if orig_msg_id:
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=orig_chat_id,
+                        message_id=orig_msg_id,
+                        text=upd_text,
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+            else:
+                await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+    except Exception as e:
+        log.warning("Ошибка обработки маркера обновления в post_init: %s", e)
+
+    if not was_updated:
+        try:
+            msg = await app.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"🟢 NaviSan бот запущен. Слежу за {INBOX.name}.",
+            )
+            delete_later(app.bot, OWNER_ID, msg.message_id, delay=5.0)
+        except Exception:
+            log.warning("Не удалось отправить приветственное сообщение")
 
 
 def main() -> None:
@@ -3175,6 +3331,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("config", cmd_settings))
+    app.add_handler(CommandHandler("update", cmd_update))
 
     # Callback-кнопки
     app.add_handler(CallbackQueryHandler(on_upgrade_callback, pattern=r"^upgrade:"))
@@ -3185,6 +3342,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_artist_callback, pattern=r"^artist:"))
     app.add_handler(CallbackQueryHandler(on_report_callback, pattern=r"^report:"))
     app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^settings:"))
+    app.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^update:"))
 
     # Сообщения владельца (текст или документы .lrc для ручного ввода текста песни или имени артиста)
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, on_owner_message))

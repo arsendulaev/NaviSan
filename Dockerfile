@@ -23,10 +23,10 @@ RUN groupadd --gid 1000 navisan \
 
 WORKDIR /app
 
-# 1. Системный пакет flac (metaflac для ReplayGain).
-# Устанавливается точечно с --no-install-recommends и кэшируется намертво.
+# 1. Системные пакеты flac (ReplayGain) и git (для самообновления)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     flac \
+    git \
  && rm -rf /var/lib/apt/lists/*
 
 # 2. Python-зависимости (кэшируются, пока requirements.txt не меняется)
@@ -38,6 +38,11 @@ COPY *.py ./
 
 # Переключаемся на непривилегированного пользователя
 USER navisan
+
+# Настройка безопасной директории git для работы с монтируемым репозиторием
+RUN git config --global --add safe.directory /app \
+ && git config --global --add safe.directory '*' \
+ && git config --global url."https://github.com/".insteadOf "git@github.com:"
 
 # .env монтируется снаружи как volume — не копируем его в образ
 # Точки монтирования описаны в docker-compose.yml
