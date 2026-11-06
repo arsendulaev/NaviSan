@@ -65,6 +65,7 @@ from pipeline import (
     upgrade_library,
     enrich_single_track_release,
 )
+from sanitizer import TagSanitizer
 from watcher import watch_inbox
 
 load_dotenv()
