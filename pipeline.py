@@ -815,17 +815,27 @@ def get_album_artist_suggestions(folder: Path) -> list[str]:
     return suggestions
 
 
+def parse_artist_input(raw: str, sanitizer: TagSanitizer | None = None) -> list[str]:
+    """Разбирает пользовательскую строку исполнителей (запятые, точки с запятой, слеши, feat).
+    
+    Приводит каждого исполнителя к каноническому виду через TagSanitizer и базу Navidrome.
+    """
+    raw_clean = (raw or "").strip()
+    if not raw_clean:
+        return []
+    s = sanitizer if sanitizer is not None else TagSanitizer()
+    return s.process_artists(raw_clean)
+
+
 def add_track_artist(track_path: Path, new_artist: str) -> list[str]:
-    """Добавляет артиста в тег ARTIST трека (ручной ввод не разбивается)."""
+    """Добавляет одного или нескольких артистов в тег ARTIST трека."""
     raw = new_artist.strip()
     if not raw or not track_path.exists():
         return []
 
-    # Если пользователь явно разделил точкой с запятой ';', добавляем каждого
-    if ";" in raw:
-        to_add = [a.strip() for a in raw.split(";") if a.strip()]
-    else:
-        to_add = [raw]
+    to_add = parse_artist_input(raw)
+    if not to_add:
+        return []
 
     audio = FLAC(str(track_path))
     artists = list(audio.get("artist", []))
@@ -858,10 +868,8 @@ def update_album_artist(folder: Path, new_album_artist: str) -> tuple[Path, str]
     raw = new_album_artist.strip()
     if raw in ("-", "none", "del", "delete", "clear", ""):
         aa_list: list[str] = []
-    elif ";" in raw:
-        aa_list = [a.strip() for a in raw.split(";") if a.strip()]
     else:
-        aa_list = [raw]
+        aa_list = parse_artist_input(raw)
 
     for f in flac_files:
         try:
@@ -898,8 +906,9 @@ def replace_all_tracks_artist(folder: Path, new_artist: str) -> tuple[Path, str]
     if not raw:
         return folder, "Имя артиста не может быть пустым."
 
-    # Сохраняем имя ровно так, как ввёл пользователь (без принудительного сплита)
-    artists_list = [raw]
+    artists_list = parse_artist_input(raw)
+    if not artists_list:
+        return folder, "Не удалось распознать имя исполнителя."
 
     for f in flac_files:
         try:
@@ -914,23 +923,21 @@ def replace_all_tracks_artist(folder: Path, new_artist: str) -> tuple[Path, str]
     new_folder_str = renamer.rename_album_folder(str(folder))
     new_folder = Path(new_folder_str)
 
+    display_str = ", ".join(artists_list)
     if new_folder.name != folder.name:
-        status_str = f"Исполнитель во всех треках: {raw}\n📂 Папка переименована в `{new_folder.name}`"
+        status_str = f"Исполнитель во всех треках: {display_str}\n📂 Папка переименована в `{new_folder.name}`"
     else:
-        status_str = f"Исполнитель во всех треках: {raw}"
+        status_str = f"Исполнитель во всех треках: {display_str}"
 
     return new_folder, status_str
 
 
 def set_track_artists(track_path: Path, new_artists_str: str) -> list[str]:
-    """Устанавливает точное имя артиста для одного трека (без ошибочного сплита)."""
+    """Устанавливает точный список артистов для одного трека."""
     raw = new_artists_str.strip()
     if not raw:
         return []
-    if ";" in raw:
-        artists_list = [a.strip() for a in raw.split(";") if a.strip()]
-    else:
-        artists_list = [raw]
+    artists_list = parse_artist_input(raw)
     try:
         audio = FLAC(str(track_path))
         audio["artist"] = artists_list

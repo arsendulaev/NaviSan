@@ -97,7 +97,7 @@ def delete_later(bot, chat_id: int, message_id: int, delay: float = 4.0) -> None
 INBOX: Path = Path(os.environ.get("NAVISAN_INBOX", "/inbox"))
 STAGING: Path = Path(os.environ.get("NAVISAN_STAGING", "/staging"))
 LIBRARY: Path = Path(os.environ.get("NAVISAN_LIBRARY", "/library"))
-DB_PATH: str = os.environ.get("NAVISAN_DB", "navidrome.db")
+DB_PATH: str = TagSanitizer().db_path
 DEFAULT_ACTION: str = os.environ.get("NAVISAN_DEFAULT_ACTION", "manual").lower()
 
 
@@ -1510,7 +1510,7 @@ def _render_album_artists_all_prompt(
         f"💿 *{album_display}*",
         f"📂 Папка: `{album_dir.name}`",
         f"🏷️ Текущий ALBUMARTIST: `{current_aa}`\n",
-        "Отправь верное имя исполнителя сообщением в чат.\n",
+        "Отправь верное имя исполнителя (или нескольких через запятую/точку с запятой) сообщением в чат.\n",
         "_Имя будет записано во все треки альбома, в тег ALBUMARTIST и обновит имя папки релиза._\n",
         "Для отмены нажми кнопку ниже или отправь /cancel.",
     ]
@@ -1576,7 +1576,7 @@ def _render_album_artist_custom_prompt(
         f"💿 *{album_display}*",
         f"📂 Папка: `{album_dir.name}`",
         f"🏷️ Текущий ALBUMARTIST: `{current_aa}`\n",
-        f"Отправь новое значение ALBUMARTIST ответным сообщением в чат{example_hint}.\n",
+        f"Отправь новое значение ALBUMARTIST (или нескольких через запятую/точку с запятой) ответным сообщением в чат{example_hint}.\n",
         "_Для отмены нажми кнопку ниже или отправь /cancel._",
     ]
     back_row = [InlineKeyboardButton("⬅️ Назад к вариантам", callback_data="artist:editaa")]
@@ -1903,7 +1903,7 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         prompt = (
             f"➕ *Добавление артиста к треку:*\n🎵 *{title}*\n"
             f"👤 Текущие артисты: `{current}`\n\n"
-            f"Отправь имя артиста (или нескольких через запятую) ответным сообщением{other_hint}.\n"
+            f"Отправь имя артиста (или нескольких через запятую/точку с запятой) ответным сообщением{other_hint}.\n"
             f"Для отмены отправь команду /cancel."
         )
         prompt_msg = await ctx.bot.send_message(chat_id=OWNER_ID, text=prompt, parse_mode="Markdown")
@@ -1955,7 +1955,7 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         prompt = (
             f"✍️ *Ручной ввод артистов трека:*\n🎵 *{title}*\n"
             f"👤 Текущие артисты: `{current}`\n\n"
-            f"Отправь верное имя исполнителя ответным сообщением.\n"
+            f"Отправь верное имя исполнителя (или нескольких через запятую/точку с запятой) ответным сообщением.\n"
             f"Оно полностью заменит текущий список артистов этого трека.\n"
             f"Для отмены отправь команду /cancel."
         )
