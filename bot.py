@@ -850,9 +850,7 @@ async def cmd_cover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"🖼️ *Выбери альбом для смены обложки ({len(matches)}):*\n"]
     buttons = []
     for i, d in enumerate(matches):
-        artist, album = album_info(d)
-        display = f"{artist} — {album}" if album else d.name
-        lines.append(f"{i + 1}. `{d.name}` — {display}")
+        lines.append(f"{i + 1}. `{d.name}`")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"recover:{i}"))
 
     lines.append("\n💬 _Напиши название релиза в чат для быстрого поиска._")
@@ -1309,9 +1307,7 @@ def _render_albums_menu(matches: list[Path]) -> tuple[str, list[list[InlineKeybo
     lines = [f"📝 *Выбери альбом для настройки текстов ({len(matches)}):*\n"]
     buttons = []
     for i, d in enumerate(matches):
-        artist, album = album_info(d)
-        display = f"{artist} — {album}" if album else d.name
-        lines.append(f"{i + 1}. `{d.name}` — {display}")
+        lines.append(f"{i + 1}. `{d.name}`")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"lyrics:alb:{i}"))
 
     lines.append("\n💬 _Напиши название релиза в чат для быстрого поиска._")
@@ -1475,9 +1471,8 @@ def _render_album_artists_view(
     ]
     buttons = []
     for i, t in enumerate(info["tracks"]):
-        num = t["track_num"] or str(i + 1)
         artists_str = ", ".join(t["artists"]) if t["artists"] else "—"
-        lines.append(f"{i + 1}. `{num}. {t['title']}`\n   👤 _{artists_str}_")
+        lines.append(f"{i + 1}. `{t['title']}`\n   👤 _{artists_str}_")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:tr:{i}"))
 
     lines.append("\n_Нажми номер трека, чтобы настроить его артистов:_")
@@ -1703,9 +1698,7 @@ async def cmd_artist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"👤 *Выбери альбом для настройки артистов ({len(matches)}):*\n"]
     buttons = []
     for i, d in enumerate(matches):
-        artist, album = album_info(d)
-        display = f"{artist} — {album}" if album else d.name
-        lines.append(f"{i + 1}. `{d.name}` — {display}")
+        lines.append(f"{i + 1}. `{d.name}`")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:alb:{i}"))
 
     lines.append("\n💬 _Напиши название релиза в чат для быстрого поиска._")
@@ -3027,9 +3020,7 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 lines = [f"🖼️ *Выбери альбом для смены обложки по запросу `{query_str}` ({len(matches)}):*\n"]
                 buttons = []
                 for i, d in enumerate(matches):
-                    artist, album = album_info(d)
-                    display = f"{artist} — {album}" if album else d.name
-                    lines.append(f"{i + 1}. `{d.name}` — {display}")
+                    lines.append(f"{i + 1}. `{d.name}`")
                     buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"recover:{i}"))
                 lines.append("\n💬 _Напиши другое название в чат для изменения поиска._")
                 keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
@@ -3144,9 +3135,7 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 lines = [f"👤 *Выбери альбом для настройки артистов по запросу `{query_str}` ({len(matches)}):*\n"]
                 buttons = []
                 for i, d in enumerate(matches):
-                    artist, album = album_info(d)
-                    display = f"{artist} — {album}" if album else d.name
-                    lines.append(f"{i + 1}. `{d.name}` — {display}")
+                    lines.append(f"{i + 1}. `{d.name}`")
                     buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:alb:{i}"))
                 lines.append("\n💬 _Напиши другое название в чат для изменения поиска._")
                 keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
