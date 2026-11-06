@@ -93,6 +93,23 @@ class TagSanitizer:
         # Если файл нигде не найден, возвращаем первый предложенный или /data/navidrome.db
         return candidates[0] if candidates else "/data/navidrome.db"
 
+    def _connect(self) -> sqlite3.Connection:
+        """Создаёт безопасное read-only подключение к базе Navidrome.
+
+        База Navidrome работает в режиме WAL (Write-Ahead Logging).
+        При монтировании одиночного файла базы в контейнер с флагом :ro
+        стандартный sqlite3.connect пытается открыть файл на запись для
+        создания -shm/-wal файлов и падает с ошибкой:
+        'attempt to write a readonly database'.
+        Параметр mode=ro&immutable=1 сообщает SQLite, что файл read-only,
+        и отключает попытки создания вспомогательных файлов блокировок.
+        """
+        abs_path = os.path.abspath(self.db_path)
+        try:
+            return sqlite3.connect(f"file:{abs_path}?mode=ro&immutable=1", uri=True)
+        except Exception:
+            return sqlite3.connect(self.db_path)
+
     def _verify_db_connection(self) -> None:
         """Проверяет доступность базы и выводит информативное сообщение в лог."""
         if not os.path.exists(self.db_path):
@@ -104,7 +121,7 @@ class TagSanitizer:
             return
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT count(*) FROM artist")
                 count = cursor.fetchone()[0]
@@ -123,7 +140,7 @@ class TagSanitizer:
             return None
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
 
                 # 1. Поиск наиболее частого написания в media_file среди треков этого артиста
@@ -180,7 +197,7 @@ class TagSanitizer:
             return res
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT name FROM artist WHERE (name LIKE '%&%' OR name LIKE '% and %') AND name NOT LIKE '%,%'"
