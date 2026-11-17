@@ -175,7 +175,7 @@ async def _send_native_slideshow(
             "type": "photo",
             "photo": {
                 "type": "photo",
-                "media": c.small_url,
+                "media": c.big_url,
             },
             "caption": {
                 "text": slide_caption,
@@ -243,35 +243,18 @@ async def _send_native_slideshow(
         err_str = str(exc).lower()
         if "wrong type of the web page content" in err_str or "bad request" in err_str:
             log.warning("sendRichMessage отклонен Telegram ('%s'). Выполняем автоисправление кандидатов страницы...", exc)
-            # 1. Пробуем заменить small_url на big_url у тех кандидатов, где они различаются
-            candidates_list = list(session.candidates)
-            fixed_any = False
-            for i, c in enumerate(display):
-                if c.small_url != c.big_url:
-                    g_idx = start_idx + i
-                    candidates_list[g_idx] = replace(c, small_url=c.big_url)
-                    fixed_any = True
-
-            if fixed_any:
-                session.candidates = candidates_list
-                log.info("Повторная попытка sendRichMessage с big_url...")
-                try:
-                    return await _send_native_slideshow(app, session)
-                except Exception:
-                    pass
-
-            # 2. Если замена не помогла, исключаем сбойных кандидатов из session.candidates
+            # 1. Если Telegram отклонил запрос, исключаем сбойных кандидатов из session.candidates
             valid_cands = []
             for c in session.candidates:
                 if c in display:
                     try:
-                        r = requests.get(c.small_url, timeout=2.0, headers={"User-Agent": "Mozilla/5.0"})
+                        r = requests.get(c.big_url, timeout=2.0, headers={"User-Agent": "Mozilla/5.0"})
                         if r.status_code == 200 and "image" in r.headers.get("content-type", "").lower():
                             valid_cands.append(c)
                         else:
-                            log.warning("Исключена сбойная обложка [%s]: %s (status=%d, ctype=%s)", c.source, c.small_url, r.status_code, r.headers.get("content-type", ""))
+                            log.warning("Исключена сбойная обложка [%s]: %s (status=%d, ctype=%s)", c.source, c.big_url, r.status_code, r.headers.get("content-type", ""))
                     except Exception as test_exc:
-                        log.warning("Исключена сбойная обложка [%s]: %s (ошибка: %s)", c.source, c.small_url, test_exc)
+                        log.warning("Исключена сбойная обложка [%s]: %s (ошибка: %s)", c.source, c.big_url, test_exc)
                 else:
                     valid_cands.append(c)
 
@@ -971,7 +954,16 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     args = ctx.args or []
-    query_parts = [a for a in args if a.lower() != "force"]
+    only_mode = None
+    query_parts = []
+    for a in args:
+        al = a.lower()
+        if al in ("cover", "covers", "обложка", "обложки"):
+            only_mode = "covers"
+        elif al in ("lyrics", "lyric", "текст", "тексты"):
+            only_mode = "lyrics"
+        elif al != "force":
+            query_parts.append(a)
     query_str = " ".join(query_parts).strip()
 
     if query_str:
@@ -996,14 +988,22 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"📁 Каталог: `{LIBRARY.name}`\n"
         f"💿 Режим: *{target_desc}*\n\n"
         "*Выбери режим идеализации:*\n\n"
-        "• ▶️ *Обычный (мягкий)* — быстро заполнит только пропуски: найдет недостающие обложки, недостающие тексты и проставит ReplayGain. Существующие файлы не перезаписывает.\n\n"
-        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора (извлечёт фиты из названий), перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain.\n\n"
-        "💬 _Напиши название альбома в чат для фильтрации апгрейда._"
+        "• ▶️ *Обычный (мягкий)* — заполнит только пропуски: найдет недостающие обложки, тексты и ReplayGain.\n"
+        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора, перекачает Hi-Res обложки, обновит тексты и заново рассчитает ReplayGain.\n"
+        "• 🖼️ *Только обложки (Force)* — перекачает Hi-Res `cover.jpg` и удалит вшитые картинки из FLAC (без ReplayGain и текстов).\n"
+        "• 📝 *Только тексты (Force)* — принудительно обновит тексты `.lrc` со стримингов (с защитой караоке от даунгрейда).\n\n"
+        "💬 _Команды: `/upgrade covers`, `/upgrade lyrics`, `/upgrade [альбом]`_"
     )
 
     keyboard = [
-        [InlineKeyboardButton("▶️ Обычный апгрейд", callback_data="upgrade:start:normal")],
-        [InlineKeyboardButton("⚡ Полная пересборка (Force)", callback_data="upgrade:start:force")],
+        [
+            InlineKeyboardButton("▶️ Мягкий (всё)", callback_data="upgrade:start:normal"),
+            InlineKeyboardButton("⚡ Полный Force (всё)", callback_data="upgrade:start:force"),
+        ],
+        [
+            InlineKeyboardButton("🖼️ Только обложки (Force)", callback_data="upgrade:start:covers"),
+            InlineKeyboardButton("📝 Только тексты (Force)", callback_data="upgrade:start:lyrics"),
+        ],
         [InlineKeyboardButton("❌ Отмена", callback_data="upgrade:close")],
     ]
 
@@ -1052,6 +1052,7 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if action == "start":
         mode = parts[2] if len(parts) > 2 else "normal"
         is_force = (mode == "force")
+        only_mode = mode if mode in ("covers", "lyrics") else None
 
         if ctx.bot_data.get("upgrade_running"):
             await query.answer("Идеализация уже выполняется!", show_alert=True)
@@ -1063,7 +1064,14 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         last_edit_time = 0.0
         loop = asyncio.get_running_loop()
 
-        mode_badge = "⚡ FORCE" if is_force else "▶️ ОБЫЧНЫЙ"
+        if only_mode == "covers":
+            mode_badge = "🖼️ ОБЛОЖКИ (FORCE)"
+        elif only_mode == "lyrics":
+            mode_badge = "📝 ТЕКСТЫ (FORCE)"
+        elif is_force:
+            mode_badge = "⚡ ПОЛНЫЙ FORCE"
+        else:
+            mode_badge = "▶️ ОБЫЧНЫЙ"
 
         def _on_progress(cur: int, tot: int, alb_name: str, res: dict):
             if ctx.bot_data.get("upgrade_cancelled"):
@@ -1074,11 +1082,18 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             if cur < tot and (now - last_edit_time > 2.0):
                 last_edit_time = now
                 pct = int((cur / tot) * 100)
-                rg_str = " | 🔊 RG: +" if res.get("replaygain_added") else ""
+                if only_mode == "covers":
+                    detail_str = f"🖼️ Обложка: {'+ обновлена' if res.get('cover_added') else 'OK'}"
+                elif only_mode == "lyrics":
+                    detail_str = f"📝 Тексты: +{res.get('lyrics_added', 0)}"
+                else:
+                    rg_str = " | 🔊 RG: +" if res.get("replaygain_added") else ""
+                    detail_str = f"📝 Тексты: +{res.get('lyrics_added', 0)} | 🖼️ Обложка: {'+' if res.get('cover_added') else 'OK'}{rg_str}"
+
                 txt = (
                     f"⏳ *Идеализация библиотеки [{mode_badge}]: {cur}/{tot} ({pct}%)*\n\n"
                     f"💿 Текущий: *{alb_name}*\n"
-                    f"📝 Тексты: +{res.get('lyrics_added', 0)} | 🖼️ Обложка: {'+' if res.get('cover_added') else 'OK'}{rg_str}\n\n"
+                    f"{detail_str}\n\n"
                     f"_Пожалуйста, подожди завершения…_"
                 )
                 kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="upgrade:stop")]]
@@ -1111,6 +1126,7 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     cancel_flag=_is_cancelled,
                     force=is_force,
                     target_albums=target_albums_list,
+                    only_mode=only_mode,
                 ),
             )
         finally:
@@ -1120,18 +1136,32 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await asyncio.sleep(0.5)
 
         stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
-        rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
-        exp_added_str = f"\n🔞 Explicit (ITUNESADVISORY): *{summary.get('explicit_added', 0)}* треков" if summary.get("explicit_added") else ""
-        lbl_added_str = f"\n🏷️ Лейблы (LABEL): *{summary.get('labels_added', 0)}* альбомов" if summary.get("labels_added") else ""
-        final_text = (
-            f"✅ *Идеализация библиотеки [{mode_badge}] завершена{stopped_str}!* 🎉\n\n"
-            f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
-            f"🖼️ Добавлено/обновлено обложек: *{summary['covers_added']}*\n"
-            f"📝 Загружено текстов (.lrc): *{summary['lyrics_added']}*"
-            f"{rg_added_str}"
-            f"{exp_added_str}"
-            f"{lbl_added_str}"
-        )
+        if only_mode == "covers":
+            final_text = (
+                f"✅ *Обновление обложек [{mode_badge}] завершено{stopped_str}!* 🖼️\n\n"
+                f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
+                f"🖼️ Обновлено обложек (cover.jpg): *{summary['covers_added']}*\n"
+                f"🧹 Вшитые изображения из FLAC удалены."
+            )
+        elif only_mode == "lyrics":
+            final_text = (
+                f"✅ *Обновление текстов [{mode_badge}] завершено{stopped_str}!* 📝\n\n"
+                f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
+                f"📝 Добавлено/обновлено текстов (.lrc): *{summary['lyrics_added']}*"
+            )
+        else:
+            rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
+            exp_added_str = f"\n🔞 Explicit (ITUNESADVISORY): *{summary.get('explicit_added', 0)}* треков" if summary.get("explicit_added") else ""
+            lbl_added_str = f"\n🏷️ Лейблы (LABEL): *{summary.get('labels_added', 0)}* альбомов" if summary.get("labels_added") else ""
+            final_text = (
+                f"✅ *Идеализация библиотеки [{mode_badge}] завершена{stopped_str}!* 🎉\n\n"
+                f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
+                f"🖼️ Добавлено/обновлено обложек: *{summary['covers_added']}*\n"
+                f"📝 Загружено текстов (.lrc): *{summary['lyrics_added']}*"
+                f"{rg_added_str}"
+                f"{exp_added_str}"
+                f"{lbl_added_str}"
+            )
         final_kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="upgrade:close")]]
         await _safe_edit_message(query, final_text, reply_markup=InlineKeyboardMarkup(final_kb))
 
@@ -1221,8 +1251,8 @@ def _render_album_lyrics_tracklist(
     batch_row = []
     if n_missing > 0:
         batch_row.append(InlineKeyboardButton(f"🌐 Найти недостающие ({n_missing})", callback_data="lyrics:albmiss"))
-    if batch_row:
-        keyboard.append(batch_row)
+    batch_row.append(InlineKeyboardButton("⚡ Обновить все (Force)", callback_data="lyrics:albforce"))
+    keyboard.append(batch_row)
 
     if from_report:
         keyboard.append([
@@ -2620,6 +2650,73 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         conf = await ctx.bot.send_message(
             chat_id=OWNER_ID,
             text=f"🌐 Найдено текстов онлайн: {found_count} из {len(missing_tracks)}!",
+        )
+        delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=4.0)
+        return
+
+    if action == "albforce":
+        album_dir = ctx.bot_data.get("lyrics_album_path")
+        tracks = ctx.bot_data.get("lyrics_tracks", [])
+        if not album_dir or not tracks:
+            await _safe_answer_query(query, "❌ Альбом не выбран.", show_alert=True)
+            return
+
+        ctx.bot_data["lyrics_batch_cancel"] = False
+        await _safe_answer_query(query)
+
+        last_edit_time = 0.0
+        loop = asyncio.get_running_loop()
+
+        def _on_albforce_progress(cur: int, tot: int, tr_name: str):
+            if ctx.bot_data.get("lyrics_batch_cancel"):
+                return
+            nonlocal last_edit_time
+            now = time.time()
+            if now - last_edit_time > 1.5 or cur == tot:
+                last_edit_time = now
+                pct = int((cur / tot) * 100)
+                txt = (
+                    f"⏳ *Принудительное обновление текстов: {cur}/{tot} ({pct}%)*\n\n"
+                    f"🎵 Трек: `{tr_name}`\n"
+                    f"_Поиск в LRCLIB, LRCMUX, SyncedLyrics, Genius..._"
+                )
+                kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="lyrics:stop_batch")]]
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _safe_edit_message(query, txt, reply_markup=InlineKeyboardMarkup(kb)),
+                        loop,
+                    )
+                except Exception:
+                    pass
+
+        def _run_albforce():
+            lm = LyricManager()
+            updated = 0
+            for i, tr in enumerate(tracks):
+                if ctx.bot_data.get("lyrics_batch_cancel"):
+                    break
+                _on_albforce_progress(i + 1, len(tracks), tr.name)
+                try:
+                    res_status = lm.process_file(tr, overwrite=True, smart_upgrade=True)
+                    if any(k in res_status for k in ("Синхронизированный", "Обычный текст", "LRCLIB", "SyncedLyrics", "Genius", "Обновлено")):
+                        if "Уже есть" not in res_status:
+                            updated += 1
+                except Exception as e:
+                    log.warning("Ошибка force-обновления текста для %s: %s", tr.name, e)
+            return updated
+
+        updated_count = await loop.run_in_executor(None, _run_albforce)
+
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=from_report)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+        was_cancelled = ctx.bot_data.pop("lyrics_batch_cancel", False)
+        status_word = "остановлено" if was_cancelled else "завершено"
+
+        conf = await ctx.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"⚡ Принудительное обновление {status_word}: обновлено {updated_count} из {len(tracks)} текстов!",
         )
         delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=4.0)
         return

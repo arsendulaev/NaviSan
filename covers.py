@@ -77,8 +77,8 @@ class CoverCandidate:
     их возвращают.
     """
 
-    small_url: str          # превью ≤480 px — для Telegram MediaGroup
-    big_url: str            # полноразмерный оригинал — для вшивания в FLAC
+    small_url: str          # превью (совпадает с big_url для максимальной чёткости)
+    big_url: str            # полноразмерный оригинал — для сохранения cover.jpg
     source: str             # amazonmusic | deezer | spotify | tidal
     title: str              # название релиза из источника
     artist: str             # имя артиста из источника
@@ -274,7 +274,7 @@ def _search_yandex_covers(
         seen_uris.add(cover_uri)
 
         big_url = _build_yandex_cover_url(cover_uri, "m1000x1000")
-        small_url = _build_yandex_cover_url(cover_uri, "400x400")
+        small_url = big_url
 
         alb_artists: list[str] = []
         for a in alb.get("artists", []):
@@ -386,23 +386,18 @@ def _raw_search_covers(
 
             if msg_type == "cover":
                 big_url = obj.get("bigCoverUrl", "")
-                small_url = obj.get("smallCoverUrl", "") or big_url
+                # Используем полноразмерный URL для лучшего качества и чёткости
+                small_url = big_url
                 if not big_url or big_url in seen_urls:
                     continue
 
                 # Исключаем видео-обложки (Tidal .mp4 и др.), так как они не являются изображениями
-                if any(ext in big_url.lower() or ext in small_url.lower() for ext in (".mp4", ".m4v", ".webm", ".mov", "/videos/")):
+                if any(ext in big_url.lower() for ext in (".mp4", ".m4v", ".webm", ".mov", "/videos/")):
                     log.debug("  Пропущена видео-обложка: %s", big_url)
                     continue
 
                 seen_urls.add(big_url)
                 src = obj.get("source", "unknown")
-
-                # Для Spotify smallCoverUrl генерируется со вторичным хешем b273,
-                # который CDN Akamai периодически блокирует или отдаёт 404 серверам Telegram.
-                # bigCoverUrl у Spotify всегда отдаётся стабильно.
-                if src == "spotify" and "i.scdn.co/image/" in big_url:
-                    small_url = big_url
 
                 info = obj.get("releaseInfo", {})
                 candidate = CoverCandidate(

@@ -344,8 +344,8 @@ class FLACSurgeon:
             else:
                 del audio["genre"]
 
-        # 4. Вшивание обложки из cover.jpg
-        self._embed_cover_from_file(audio, path.parent, force_update)
+        # 4. Удаление встроенных обложек: обложка хранится строго как отдельный cover.jpg в папке
+        audio.clear_pictures()
 
         # 5. Нормализация DATE (строго 4 цифры года YYYY) и ORIGINALDATE (полная дата YYYY-MM-DD)
         raw_date = audio.get("date", [""])[0].strip()

@@ -475,25 +475,14 @@ def apply_cover(
 
 def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
     """Заменяет обложку и обновляет дату в уже существующем альбоме в Library."""
-    from mutagen.flac import Picture
-
     dest = folder / "cover.jpg"
     download_cover(cover.big_url, dest)
-    with open(dest, "rb") as f:
-        img_data = f.read()
-
-    pic = Picture()
-    pic.type = 3
-    pic.mime = "image/jpeg"
-    pic.desc = "Front Cover"
-    pic.data = img_data
 
     flacs = sorted(folder.rglob("*.flac"))
     for f in flacs:
         try:
             audio = FLAC(str(f))
             audio.clear_pictures()
-            audio.add_picture(pic)
             if cover.date:
                 year_4, full_cov_date = extract_year_and_date(cover.date)
                 if year_4:
@@ -510,7 +499,7 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
             log.warning("Не удалось обновить обложку в %s: %s", f.name, e)
 
     res_note = f" ({cover.resolution_str})" if cover.resolution_str else ""
-    return f"🖼️ Обложка [{cover.source}]{res_note} успешно вшита в {len(flacs)} треков"
+    return f"🖼️ Обложка [{cover.source}]{res_note} успешно сохранена в cover.jpg"
 
 
 def apply_pipeline(
@@ -1533,14 +1522,13 @@ def upgrade_album(
     force_replaygain: bool = False,
     force: bool = False,
     cancel_flag: Callable[[], bool] | None = None,
+    only_mode: str | None = None,
 ) -> dict:
-    """Выполняет полную стандартизацию («идеализацию») альбома на месте.
+    """Выполняет стандартизацию («идеализацию») альбома на месте.
 
-    1. Очищает и нормализует теги всех треков (FLACSurgeon + TagSanitizer).
-    2. Проверяет обложку: если её нет (или force_cover/force=True), ищет и вшивает.
-    3. Переименовывает треки в '01. Title.flac' и ищет синхронизированные тексты (.lrc).
-    4. Приводит имя папки релиза к 'Artist - Album'.
-    5. Рассчитывает ReplayGain (потрековый и альбомный).
+    Параметр only_mode позволяет выполнить точечное быстрое обновление:
+    - 'covers': поиск/сохранение Hi-Res cover.jpg и удаление вшитых картинок (без текстов и ReplayGain).
+    - 'lyrics': принудительное обновление текстов со стримингов (без обложек и ReplayGain).
     """
     if cancel_flag and cancel_flag():
         return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
@@ -1553,6 +1541,84 @@ def upgrade_album(
     flac_files = sorted(album_dir.rglob("*.flac"))
     if not flac_files:
         return {"error": "no_flacs", "folder": album_dir.name}
+
+    # Режим быстрого обновления ТОЛЬКО обложек (Force)
+    if only_mode == "covers":
+        for flac in flac_files:
+            if cancel_flag and cancel_flag():
+                return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
+            try:
+                audio = FLAC(str(flac))
+                if audio.pictures:
+                    audio.clear_pictures()
+                    audio.save()
+            except Exception as e:
+                log.debug("Ошибка очистки вшитых картинок в %s: %s", flac.name, e)
+
+        cover_added = False
+        artist, album = album_info(album_dir)
+        if artist and album:
+            try:
+                candidates = search_covers(artist, album)
+                if candidates:
+                    chosen = candidates[0]
+                    if is_valid_cover_candidate(chosen, artist, album):
+                        update_album_cover(album_dir, chosen)
+                        cover_added = True
+                    else:
+                        log.warning(
+                            "Автоматический подбор обложки для '%s — %s': кандидат '%s — %s' не прошёл валидацию названия.",
+                            artist, album, chosen.artist, chosen.title
+                        )
+            except Exception as e:
+                log.warning("Не удалось найти обложку для %s — %s: %s", artist, album, e)
+
+        return {
+            "old_folder": album_dir.name,
+            "new_folder": album_dir.name,
+            "folder_path": album_dir,
+            "tracks_count": len(flac_files),
+            "cover_added": cover_added,
+            "lyrics_added": 0,
+            "replaygain_added": False,
+            "explicit_added": 0,
+            "label": False,
+        }
+
+    # Режим быстрого обновления ТОЛЬКО текстов песен (Force)
+    if only_mode == "lyrics":
+        lyrics_added = 0
+        lyricist = LyricManager()
+        for flac in flac_files:
+            if cancel_flag and cancel_flag():
+                return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
+            try:
+                res_status = lyricist.process_file(flac, overwrite=True, smart_upgrade=True)
+                if any(k in res_status for k in ("Синхронизированный", "Обычный текст", "LRCLIB", "SyncedLyrics", "Genius", "Обновлено")):
+                    if "Уже есть" not in res_status and "Сохранено" not in res_status:
+                        lyrics_added += 1
+            except Exception as e:
+                log.warning("Ошибка обработки текста трека %s: %s", flac.name, e)
+
+        current_flac_stems = {f.stem for f in album_dir.rglob("*.flac")}
+        for lrc_f in album_dir.rglob("*.lrc"):
+            if lrc_f.stem not in current_flac_stems:
+                try:
+                    lrc_f.unlink()
+                except Exception:
+                    pass
+
+        return {
+            "old_folder": album_dir.name,
+            "new_folder": album_dir.name,
+            "folder_path": album_dir,
+            "tracks_count": len(flac_files),
+            "cover_added": False,
+            "lyrics_added": lyrics_added,
+            "replaygain_added": False,
+            "explicit_added": 0,
+            "label": False,
+        }
 
     sanitizer = TagSanitizer(db_path=db_path)
     surgeon = FLACSurgeon(sanitizer=sanitizer)
@@ -1696,6 +1762,7 @@ def upgrade_library(
     cancel_flag: Callable[[], bool] | None = None,
     force: bool = False,
     target_albums: list[Path] | None = None,
+    only_mode: str | None = None,
 ) -> dict:
     """Выполняет пакетную стандартизацию («идеализацию») альбомов в Library."""
     if target_albums is not None:
@@ -1720,7 +1787,7 @@ def upgrade_library(
             log.info("Идеализация библиотеки прервана пользователем")
             break
 
-        res = upgrade_album(album_folder, db_path=db_path, force=force, cancel_flag=cancel_flag)
+        res = upgrade_album(album_folder, db_path=db_path, force=force, cancel_flag=cancel_flag, only_mode=only_mode)
         if res.get("cancelled") or (cancel_flag and cancel_flag()):
             log.info("Идеализация библиотеки прервана пользователем")
             break
