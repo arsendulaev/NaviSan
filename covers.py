@@ -243,10 +243,17 @@ def _search_yandex_covers(
             timeout=(_CONNECT_TIMEOUT, _STREAM_TIMEOUT),
         )
         if resp.status_code == 451:
-            log.warning(
-                "Yandex Music API вернул 451 (геоблокировка). "
-                "Запрос отклонён Яндексом! Укажите YANDEX_MUSIC_TOKEN в .env для работы из-за рубежа."
-            )
+            if token:
+                log.warning(
+                    "Yandex Music API вернул 451 (геоблокировка). "
+                    "Токен указан, но на этом аккаунте Яндекса нет активной подписки Яндекс Плюс. "
+                    "Для запросов с зарубежных IP Яндекс требует аккаунт с активным Плюсом."
+                )
+            else:
+                log.warning(
+                    "Yandex Music API вернул 451 (геоблокировка). "
+                    "Запрос отклонён Яндексом! Укажите YANDEX_MUSIC_TOKEN (с активным Яндекс Плюс) в .env для работы из-за рубежа."
+                )
             raise YandexGeoblockError()
         if resp.status_code == 401:
             log.warning("Yandex Music API: 401 Unauthorized (проверьте YANDEX_MUSIC_TOKEN в .env)")
