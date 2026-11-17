@@ -67,7 +67,7 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
 
     # 1. Поиск в iTunes Search API
     for q in queries[:3]:
-        for country in [None, "US"]:
+        for country in [None, "RU", "US"]:
             try:
                 params = {"term": q, "entity": "song", "limit": 15}
                 if country:
@@ -142,7 +142,16 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
                             alb_r = httpx.get(f"https://api.deezer.com/album/{d_alb_id}", headers=headers, timeout=4.0).json()
                             nb = alb_r.get("nb_tracks", 1)
                             rec_type = alb_r.get("record_type", "album")
-                            aa = alb_r.get("artist", {}).get("name") or d_art
+                            contributors = alb_r.get("contributors", [])
+                            main_contribs = [
+                                c.get("name", "").strip()
+                                for c in contributors
+                                if c.get("role") == "Main" and c.get("name")
+                            ]
+                            if main_contribs:
+                                aa = " & ".join(main_contribs)
+                            else:
+                                aa = alb_r.get("artist", {}).get("name") or d_art
                             genres_raw = alb_r.get("genres", {}).get("data", [])
                             genre_cand = genres_raw[0].get("name", "") if genres_raw else ""
                             raw_candidates.append({
@@ -193,7 +202,7 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
     return chosen
 
 
-def enrich_single_track_release(folder: Path) -> dict | None:
+def enrich_single_track_release(folder: Path, force: bool = False) -> dict | None:
     """Для релиза из 1 трека определяет родительский альбом и канонического Album Artist онлайн.
 
     Если трек выходил в составе полноформатного альбома или EP, обновляет теги
@@ -232,13 +241,14 @@ def enrich_single_track_release(folder: Path) -> dict | None:
         return None
 
     # Проверяем, нужна ли онлайн-проверка:
-    # если уже есть 1 альбомный артист, альбом отличается от названия трека,
+    # если не force, уже есть альбомный артист, альбом отличается от названия трека,
     # не содержит "single" и трек-тотал > 2 — повторный сетевой запрос не нужен.
     cur_aa = audio.get("albumartist", [])
     cur_album = audio.get("album", [""])[0].strip()
     cur_tot = int(audio.get("tracktotal", ["0"])[0] if audio.get("tracktotal", ["0"])[0].isdigit() else 0)
     if (
-        len(cur_aa) == 1
+        not force
+        and len(cur_aa) >= 1
         and cur_album
         and cur_album.lower() != title.lower()
         and "single" not in cur_album.lower()
@@ -256,7 +266,7 @@ def enrich_single_track_release(folder: Path) -> dict | None:
     new_album = info.get("album", "").strip()
     if new_album:
         cur_album = audio.get("album", [""])[0].strip()
-        if not cur_album or cur_album.lower() == title.lower() or "single" in cur_album.lower() or not info.get("is_single"):
+        if force or not cur_album or cur_album.lower() == title.lower() or "single" in cur_album.lower() or not info.get("is_single"):
             audio["album"] = [new_album]
             changed = True
 
@@ -266,8 +276,10 @@ def enrich_single_track_release(folder: Path) -> dict | None:
         sanitizer = TagSanitizer()
         canonical_aa = sanitizer.process_artists(new_aa)
         if canonical_aa:
-            audio["albumartist"] = canonical_aa
-            changed = True
+            cur_aa = audio.get("albumartist", [])
+            if force or not cur_aa or cur_aa != canonical_aa:
+                audio["albumartist"] = canonical_aa
+                changed = True
 
     # 3. TRACKNUMBER & TRACKTOTAL
     num = info.get("track_number")
@@ -538,9 +550,9 @@ def apply_pipeline(
     for flac in flac_files:
         surgeon.heal_file(str(flac))
 
-    # Онлайн-обогащение метаданных (Explicit, Label, Genre, Date, Track numbers/totals)
+    # Онлайн-обогащение метаданных (Explicit, Label, Genre, Date, Track numbers/totals, Album Artist)
     try:
-        enrich_album_online_metadata(folder, force=False)
+        enrich_album_online_metadata(folder, force=False, db_path=db_path)
     except Exception as e:
         log.warning("Ошибка enrich_album_online_metadata: %s", e)
 
@@ -784,7 +796,7 @@ def get_album_artist_suggestions(folder: Path) -> list[str]:
             suggestions.append(all_str)
 
     # 2. Общие артисты для всех треков (если отличаются от всех уникальных)
-    if track_artist_sets:
+    if track_artist_sets and len(tracks) >= 2:
         common = set.intersection(*track_artist_sets)
         if common:
             common_ordered = [a for a in all_unique if a in common]
@@ -946,13 +958,14 @@ class OnlineAlbumInfo:
     genres: list[str] = field(default_factory=list)
     release_date: str = ""
     total_tracks: int = 0
+    album_artist: str = ""
 
 
 @lru_cache(maxsize=128)
-def _fetch_genius_album_tracks_cached(artist: str, album: str) -> tuple[tuple[tuple[str, int], ...], int, str]:
+def _fetch_genius_album_tracks_cached(artist: str, album: str) -> tuple[tuple[tuple[str, int], ...], int, str, str]:
     """Запрашивает треклист альбома из Genius API с кэшированием."""
     if not artist or not album:
-        return (), 0, ""
+        return (), 0, "", ""
 
     def norm(s: str) -> str:
         return re.sub(r"[^\w]", "", s.lower().replace("ё", "е"))
@@ -1011,6 +1024,7 @@ def _fetch_genius_album_tracks_cached(artist: str, album: str) -> tuple[tuple[tu
             best_pos_items: list[tuple[str, int]] = []
             best_total = 0
             best_date = ""
+            best_art = ""
 
             for alb_id, alb_name, art_name, res in candidates[:3]:
                 try:
@@ -1056,21 +1070,22 @@ def _fetch_genius_album_tracks_cached(artist: str, album: str) -> tuple[tuple[tu
                         best_pos_items = list(pos_m.items())
                         best_total = len(g_tracks)
                         best_date = rel_date
+                        best_art = art_name
                 except Exception as e:
                     log.debug("Ошибка получения треков из Genius для альбома %s: %s", alb_id, e)
 
-            return tuple(best_pos_items), best_total, best_date
+            return tuple(best_pos_items), best_total, best_date, best_art
     except Exception as e:
         log.debug("Genius API error for '%s — %s': %s", artist, album, e)
-        return (), 0, ""
+        return (), 0, "", ""
 
 
-def fetch_genius_album_tracks(artist: str, album: str) -> tuple[dict[str, int], int, str]:
+def fetch_genius_album_tracks(artist: str, album: str) -> tuple[dict[str, int], int, str, str]:
     """Запрашивает треклист альбома из Genius API.
-    Возвращает (track_positions, total_tracks, release_date).
+    Возвращает (track_positions, total_tracks, release_date, album_artist).
     """
-    items, total, dt = _fetch_genius_album_tracks_cached(artist, album)
-    return dict(items), total, dt
+    items, total, dt, art = _fetch_genius_album_tracks_cached(artist, album)
+    return dict(items), total, dt, art
 
 
 def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
@@ -1113,6 +1128,19 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
                         raw_genres = alb_json.get("genres", {}).get("data", [])
                         genres_list = parse_genres([g.get("name", "") for g in raw_genres if g.get("name")])
 
+                        # Определение исполнителя(ей) альбома из Deezer:
+                        # если альбом совместный, contributors с role='Main' содержит всех соавторов релиза
+                        contributors = alb_json.get("contributors", [])
+                        main_contribs = [
+                            c.get("name", "").strip()
+                            for c in contributors
+                            if c.get("role") == "Main" and c.get("name")
+                        ]
+                        if main_contribs:
+                            alb_artist = " & ".join(main_contribs)
+                        else:
+                            alb_artist = (alb_json.get("artist", {}).get("name") or "").strip()
+
                         tracks = alb_json.get("tracks", {}).get("data", [])
                         m: dict[str, bool] = {}
                         pos_m: dict[str, int] = {}
@@ -1129,7 +1157,7 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
                             if base_t:
                                 pos_m[norm(base_t)] = pos
 
-                        if m or label or rel_date or genres_list:
+                        if m or label or rel_date or genres_list or alb_artist:
                             return OnlineAlbumInfo(
                                 explicit_map=m,
                                 track_positions=pos_m,
@@ -1137,65 +1165,72 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
                                 genres=genres_list,
                                 release_date=rel_date,
                                 total_tracks=nb_tracks,
+                                album_artist=alb_artist,
                             )
         except Exception as e:
             log.debug("Ошибка запроса метаданных из Deezer для '%s': %s", q, e)
 
     # 2. iTunes API fallback
-    try:
-        r = httpx.get(
-            "https://itunes.apple.com/search",
-            params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
-            timeout=4.0,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if r.status_code == 200:
-            res = r.json().get("results", [])
-            if res:
-                coll_id = res[0].get("collectionId")
-                raw_c = (res[0].get("copyright") or "").strip()
-                clean_lbl = re.sub(r"(?i)^[℗p©c\s\d\-–/]+", "", raw_c).strip()
-                raw_date = (res[0].get("releaseDate") or "").strip()
-                rel_date = clean_date_str(raw_date)
-                nb_tracks = int(res[0].get("trackCount") or 0)
-                genre_name = (res[0].get("primaryGenreName") or "").strip()
-                genres_list = parse_genres(genre_name) if genre_name else []
+    for country in [None, "RU", "US"]:
+        try:
+            params = {"term": f"{artist} {album}", "entity": "album", "limit": 1}
+            if country:
+                params["country"] = country
+            r = httpx.get(
+                "https://itunes.apple.com/search",
+                params=params,
+                timeout=4.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                res = r.json().get("results", [])
+                if res:
+                    alb_artist = (res[0].get("collectionArtistName") or res[0].get("artistName") or "").strip()
+                    coll_id = res[0].get("collectionId")
+                    raw_c = (res[0].get("copyright") or "").strip()
+                    clean_lbl = re.sub(r"(?i)^[℗p©c\s\d\-–/]+", "", raw_c).strip()
+                    raw_date = (res[0].get("releaseDate") or "").strip()
+                    rel_date = clean_date_str(raw_date)
+                    nb_tracks = int(res[0].get("trackCount") or 0)
+                    genre_name = (res[0].get("primaryGenreName") or "").strip()
+                    genres_list = parse_genres(genre_name) if genre_name else []
 
-                r2 = httpx.get(
-                    "https://itunes.apple.com/lookup",
-                    params={"id": coll_id, "entity": "song"},
-                    timeout=4.0,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                m = {}
-                pos_m = {}
-                if r2.status_code == 200:
-                    for tr in r2.json().get("results", []):
-                        if tr.get("wrapperType") == "track":
-                            t_title = tr.get("trackName", "")
-                            is_exp = (tr.get("trackExplicitness") == "explicit")
-                            pos = tr.get("trackNumber") or 0
-                            m[norm(t_title)] = is_exp
-                            if pos:
-                                pos_m[norm(t_title)] = pos
-                                base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_title).strip()
-                                if base_t:
-                                    pos_m[norm(base_t)] = pos
-
-                if m or clean_lbl or rel_date or genres_list:
-                    return OnlineAlbumInfo(
-                        explicit_map=m,
-                        track_positions=pos_m,
-                        label=clean_lbl,
-                        genres=genres_list,
-                        release_date=rel_date,
-                        total_tracks=nb_tracks,
+                    r2 = httpx.get(
+                        "https://itunes.apple.com/lookup",
+                        params={"id": coll_id, "entity": "song"},
+                        timeout=4.0,
+                        headers={"User-Agent": "Mozilla/5.0"},
                     )
-    except Exception as e:
-        log.debug("Ошибка запроса метаданных из iTunes для '%s — %s': %s", artist, album, e)
+                    m = {}
+                    pos_m = {}
+                    if r2.status_code == 200:
+                        for tr in r2.json().get("results", []):
+                            if tr.get("wrapperType") == "track":
+                                t_title = tr.get("trackName", "")
+                                is_exp = (tr.get("trackExplicitness") == "explicit")
+                                pos = tr.get("trackNumber") or 0
+                                m[norm(t_title)] = is_exp
+                                if pos:
+                                    pos_m[norm(t_title)] = pos
+                                    base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_title).strip()
+                                    if base_t:
+                                        pos_m[norm(base_t)] = pos
+
+                    if m or clean_lbl or rel_date or genres_list or alb_artist:
+                        return OnlineAlbumInfo(
+                            explicit_map=m,
+                            track_positions=pos_m,
+                            label=clean_lbl,
+                            genres=genres_list,
+                            release_date=rel_date,
+                            total_tracks=nb_tracks,
+                            album_artist=alb_artist,
+                        )
+        except Exception as e:
+            log.debug("Ошибка запроса метаданных из iTunes для '%s — %s' (country=%s): %s", artist, album, country, e)
 
     # 3. Genius API fallback (для релизов, не найденных в Deezer/iTunes)
-    g_pos, g_tot, g_date = fetch_genius_album_tracks(artist, album)
+    g_pos, g_tot, g_date, g_art = fetch_genius_album_tracks(artist, album)
     if g_pos:
         log.info(
             "Genius fallback: найден альбом '%s — %s' (треков: %d)",
@@ -1207,13 +1242,14 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
             track_positions=g_pos,
             release_date=g_date,
             total_tracks=g_tot,
+            album_artist=g_art,
         )
 
     return OnlineAlbumInfo()
 
 
-def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int, str]:
-    """Определяет explicit-статус треков, лейбл, жанры, дату релиза и номера треков через Deezer/iTunes."""
+def enrich_album_online_metadata(folder: Path, force: bool = False, db_path: str | Path = "navidrome.db") -> tuple[int, str]:
+    """Определяет explicit-статус треков, лейбл, жанры, дату релиза, номера треков и канонический ALBUMARTIST через Deezer/iTunes."""
     flac_files = sorted(folder.rglob("*.flac"))
     if not flac_files:
         return 0, ""
@@ -1228,8 +1264,10 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
     # 1) если у Deezer/iTunes нет track_positions
     # 2) если на стримингах меньше треков, чем файлов в папке (усечённый стриминг-релиз)
     if not info.track_positions or info.total_tracks < len(flac_files):
-        g_pos, g_total, g_date = fetch_genius_album_tracks(artist, album)
+        g_pos, g_total, g_date, g_art = fetch_genius_album_tracks(artist, album)
         if g_pos:
+            if not info.album_artist and g_art:
+                info.album_artist = g_art
             if not info.track_positions or (g_total >= len(flac_files) > info.total_tracks):
                 log.info(
                     "Genius треклист выбран как более полный (%d треков против %d в стриминге): '%s — %s'",
@@ -1326,8 +1364,10 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
 
     # Если после первого сопоставления остались файлы без номера, проверяем Genius
     if len(matched_pos) < len(files_data):
-        g_pos, g_total, g_date = fetch_genius_album_tracks(artist, album)
+        g_pos, g_total, g_date, g_art = fetch_genius_album_tracks(artist, album)
         if g_pos:
+            if not info.album_artist and g_art:
+                info.album_artist = g_art
             for fd in files_data:
                 f = fd["file"]
                 if f in matched_pos:
@@ -1390,12 +1430,33 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
     max_assigned = max(final_track_numbers.values()) if final_track_numbers else 0
     calculated_total_tracks = max(info.total_tracks or 0, max_assigned, len(flac_files))
 
+    aa_applied = ""
+
     for fd in files_data:
         f = fd["file"]
         audio = fd["audio"]
         changed = False
 
         try:
+            # 0. Простановка ALBUMARTIST из подтверждённых онлайн-метаданных
+            if info.album_artist:
+                sanitizer = TagSanitizer(db_path=db_path)
+                canonical_aa = sanitizer.process_artists(info.album_artist)
+                if canonical_aa:
+                    cur_aa = audio.get("albumartist", [])
+                    should_update_aa = False
+                    if force or not cur_aa:
+                        should_update_aa = True
+                    elif len(flac_files) == 1 and set(cur_aa) != set(canonical_aa):
+                        should_update_aa = True
+                    elif set(canonical_aa).issubset(set(cur_aa)) and len(cur_aa) > len(canonical_aa):
+                        should_update_aa = True
+
+                    if should_update_aa and cur_aa != canonical_aa:
+                        audio["albumartist"] = canonical_aa
+                        changed = True
+                        aa_applied = ", ".join(canonical_aa)
+
             # 1. Простановка лейбла
             if info.label:
                 existing_label = audio.get("label", [""])[0].strip()
@@ -1479,6 +1540,8 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
         except Exception as e:
             log.warning("Ошибка обогащения онлайн-метаданных для %s: %s", f.name, e)
 
+    if aa_applied:
+        log.info("Проставлен тег ALBUMARTIST ('%s') для треков в %s", aa_applied, folder.name)
     if marked_count > 0:
         log.info("Проставлен тег ITUNESADVISORY (Explicit) для %d треков в %s", marked_count, folder.name)
     if label_applied:
@@ -1628,6 +1691,12 @@ def upgrade_album(
     cover_added = False
     lyrics_added = 0
 
+    if len(flac_files) == 1:
+        try:
+            enrich_single_track_release(album_dir, force=force)
+        except Exception as e:
+            log.warning("Ошибка enrich_single_track_release в upgrade_album: %s", e)
+
     # Шаг 1: Первым делом чистим и нормализуем метаданные во всех треках
     for flac in flac_files:
         if cancel_flag and cancel_flag():
@@ -1640,7 +1709,9 @@ def upgrade_album(
     # Шаг 1.5: При force-режиме не доверяем рипперам: определяем артистов,
     # которые присутствуют во всех 100% треков релиза, сортируем их по алфавиту
     # и обновляем ALBUMARTIST в тегах всех файлов.
-    if force:
+    # ВНИМАНИЕ: выполняется ТОЛЬКО при наличии >= 2 треков, чтобы для одиночных
+    # треков фиты (гостевые артисты) не становились артистами альбома.
+    if force and len(flac_files) >= 2:
         if cancel_flag and cancel_flag():
             return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
         track_artists_sets = []
@@ -1669,10 +1740,10 @@ def upgrade_album(
                     except Exception as e:
                         log.warning("Не удалось обновить ALBUMARTIST в %s: %s", f.name, e)
 
-    # Шаг 1.6: Онлайн-проверка Explicit-статуса и лейбла через Deezer/iTunes
+    # Шаг 1.6: Онлайн-проверка Explicit-статуса, лейбла, даты и канонического ALBUMARTIST через Deezer/iTunes
     if cancel_flag and cancel_flag():
         return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
-    explicit_added, label_added = enrich_album_online_metadata(album_dir, force=force)
+    explicit_added, label_added = enrich_album_online_metadata(album_dir, force=force, db_path=db_path)
 
     # Шаг 2: Теперь берём гарантированно чистые artist и album для поиска обложки
     if cancel_flag and cancel_flag():
