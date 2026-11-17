@@ -119,10 +119,16 @@ class FileSystemManager:
         if force_common_artists and len(flac_files) >= 2 and track_artists_sets:
             common = set.intersection(*track_artists_sets)
             if common:
-                final_artists = sorted(common, key=lambda s: s.casefold())
+                try:
+                    first_track_artists = FLAC(str(flac_files[0])).get("artist", [])
+                    final_artists = [art for art in first_track_artists if art in common]
+                    if not final_artists:
+                        final_artists = list(common)
+                except Exception:
+                    final_artists = list(common)
             elif album_artists_list:
                 best_aa = Counter(album_artists_list).most_common(1)[0][0]
-                final_artists = sorted(best_aa, key=lambda s: s.casefold())
+                final_artists = list(best_aa)
             else:
                 final_artists = ["Various Artists"]
         elif album_artists_list:

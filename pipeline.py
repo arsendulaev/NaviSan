@@ -1542,6 +1542,9 @@ def enrich_album_online_metadata(folder: Path, force: bool = False, db_path: str
                         should_update_aa = True
                     elif set(canonical_aa).issubset(set(cur_aa)) and len(cur_aa) > len(canonical_aa):
                         should_update_aa = True
+                    elif set(cur_aa) == set(canonical_aa) and cur_aa != canonical_aa:
+                        # Автоматически исправляем обратный/алфавитный порядок исполнителей на канонический
+                        should_update_aa = True
 
                     if should_update_aa and cur_aa != canonical_aa:
                         audio["albumartist"] = canonical_aa
@@ -1813,15 +1816,21 @@ def upgrade_album(
         if track_artists_sets:
             common = set.intersection(*track_artists_sets)
             if common:
-                sorted_common = sorted(common, key=lambda s: s.casefold())
+                try:
+                    first_arts = FLAC(str(flac_files[0])).get("artist", [])
+                    ordered_common = [a for a in first_arts if a in common]
+                    if not ordered_common:
+                        ordered_common = list(common)
+                except Exception:
+                    ordered_common = list(common)
                 log.info(
-                    "Force upgrade: определены общие артисты релиза (по алфавиту): %s",
-                    sorted_common,
+                    "Force upgrade: определены общие артисты релиза (канонический порядок): %s",
+                    ordered_common,
                 )
                 for f in flac_files:
                     try:
                         audio = FLAC(str(f))
-                        audio["albumartist"] = sorted_common
+                        audio["albumartist"] = ordered_common
                         audio.save()
                     except Exception as e:
                         log.warning("Не удалось обновить ALBUMARTIST в %s: %s", f.name, e)
