@@ -758,16 +758,25 @@ def cleanup_inbox(inbox_folder: Path) -> bool:
     Устойчива к ошибкам прав доступа:
     - Снимает защиту от записи (chmod 0777) перед удалением.
     - В случае ошибки прав на стороне хоста не прерывает pipeline (альбом уже сохранён).
+    - Честно проверяет факт удаления с диска, исключая ложные сообщения об успехе.
     """
     if not inbox_folder.exists():
         return True
 
+    def _force_rm(func, path, exc_info):
+        try:
+            os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+            func(path)
+        except Exception:
+            pass
+
     try:
-        shutil.rmtree(inbox_folder, onexc=_force_remove_readonly)
-        log.info("Inbox: удалено %s", inbox_folder.name)
-        return True
+        shutil.rmtree(inbox_folder, onexc=_force_rm)
     except Exception as exc:
-        log.warning("Не удалось автоматически удалить папку %s из Inbox (права доступа): %s", inbox_folder.name, exc)
+        log.warning("Ошибка при вызове shutil.rmtree для %s: %s", inbox_folder.name, exc)
+
+    # Пробуем дочистить отдельные файлы, если папка всё ещё существует
+    if inbox_folder.exists():
         for f in list(inbox_folder.rglob("*")):
             try:
                 if f.is_file():
@@ -780,9 +789,15 @@ def cleanup_inbox(inbox_folder: Path) -> bool:
                 pass
         try:
             inbox_folder.rmdir()
-            return True
         except Exception:
-            return False
+            pass
+
+    if not inbox_folder.exists():
+        log.info("Inbox: удалено %s", inbox_folder.name)
+        return True
+    else:
+        log.warning("Inbox: НЕ удалось удалить папку %s (ограничение прав на сервере)", inbox_folder.name)
+        return False
 
 
 # ── Хелперы ──────────────────────────────────────────────────────────────────
