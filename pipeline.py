@@ -268,11 +268,19 @@ def ensure_single_track_metadata(folder: Path, force: bool = False) -> dict | No
     cur_tot = audio.get("tracktotal", [""])[0].strip()
     changed = False
 
+    norm_album = re.sub(r"[^\w]", "", cur_album.lower())
+    norm_title = re.sub(r"[^\w]", "", title.lower())
+    clean_cur_alb = re.sub(r"(?i)\s*[\(\[](?:feat\.?|ft\.?|with|prod\.?|single).*?[\)\]]", "", cur_album).strip()
+    clean_cur_alb = re.sub(r"(?i)\s*-\s*single$", "", clean_cur_alb).strip()
+    norm_clean_alb = re.sub(r"[^\w]", "", clean_cur_alb.lower())
+
     is_single = (
         not cur_album
-        or cur_album.lower() in (title.lower(), "single", "unknown_release", "")
+        or norm_album == norm_title
+        or norm_clean_alb == norm_title
+        or cur_album.lower() in ("single", "unknown_release", "unknown", "сингл")
         or "single" in cur_album.lower()
-        or cur_tot in ("1", "01", "")
+        or "сингл" in cur_album.lower()
     )
 
     if is_single:
@@ -638,12 +646,8 @@ def find_existing_library_album(staging_folder: Path, library_root: Path) -> Pat
                 # Проверка названий песен
                 st_t = _norm(st_a.get("title", [""])[0] or st_flacs[0].stem)
                 ex_t = _norm(ex_a.get("title", [""])[0] or ex_flacs[0].stem)
-                if st_t and ex_t:
-                    if st_t != ex_t:
-                        return False
-                    # Цифры обязаны совпадать (защита от Мысли вслух vs Мысли вслух 5)
-                    if re.findall(r"\d+", st_t) != re.findall(r"\d+", ex_t):
-                        return False
+                if st_t and ex_t and st_t != ex_t:
+                    return False
             except Exception:
                 pass
         return True
@@ -1528,7 +1532,14 @@ def enrich_album_online_metadata(folder: Path, force: bool = False, db_path: str
         changed = False
 
         try:
-            # 0. Простановка ALBUMARTIST из подтверждённых онлайн-метаданных
+            # 0. Приведение тега ALBUM к названию альбома для многотрековых релизов
+            if album and len(flac_files) >= 2:
+                cur_alb = audio.get("album", [""])[0].strip()
+                if cur_alb != album:
+                    audio["album"] = [album]
+                    changed = True
+
+            # 0.1. Простановка ALBUMARTIST из подтверждённых онлайн-метаданных
             if info.album_artist:
                 sanitizer = TagSanitizer(db_path=db_path)
                 canonical_aa = sanitizer.process_artists(info.album_artist)
