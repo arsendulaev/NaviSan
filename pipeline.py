@@ -238,13 +238,13 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
     return chosen
 
 
-def enrich_single_track_release(folder: Path, force: bool = False) -> dict | None:
-    """Для релиза из 1 трека определяет родительский альбом и канонического Album Artist онлайн.
+def ensure_single_track_metadata(folder: Path, force: bool = False) -> dict | None:
+    """Для релиза из 1 трека гарантирует уважение к статусу сингла.
 
-    Если трек выходил в составе полноформатного альбома или EP, обновляет теги
-    ALBUM, ALBUMARTIST, TRACKNUMBER, TRACKTOTAL (и DATE при необходимости),
-    чтобы релиз корректно оформлялся как альбом основного исполнителя.
-    Если трек выходил только синглом, оставляет статус сингла.
+    - Если альбом пустой, равен 'Single', или совпадает с названием трека — ALBUM = название трека.
+    - Устанавливает номер трека: 01, всего треков: 1.
+    - НИКОГДА не превращает сингл в полноформатный альбом онлайн и не переименовывает
+      его в чужие сборники/альбомы (никаких YAMAKASI для сингла 'Мало нам').
     """
     flac_files = sorted(folder.rglob("*.flac"))
     if len(flac_files) != 1:
@@ -257,116 +257,55 @@ def enrich_single_track_release(folder: Path, force: bool = False) -> dict | Non
         return None
 
     title = audio.get("title", [""])[0].strip()
-    arts = [a.strip() for a in audio.get("artist", []) if a.strip()]
-    if not arts:
-        arts = [a.strip() for a in audio.get("albumartist", []) if a.strip()]
-    artist_str = ", ".join(arts) if arts else ""
+    if not title:
+        stem = flac_path.stem
+        if " - " in stem:
+            title = stem.split(" - ", 1)[1].strip()
+        else:
+            title = stem
 
-    if not artist_str or not title:
-        name = flac_path.stem
-        if " - " in name:
-            parts = name.split(" - ", 1)
-            artist_str = artist_str or parts[0].strip()
-            title = title or parts[1].strip()
-        elif " - " in folder.name:
-            parts = folder.name.split(" - ", 1)
-            artist_str = artist_str or parts[0].strip()
-            title = title or parts[1].strip()
-
-    if not artist_str or not title:
-        return None
-
-    info = resolve_track_parent_album(artist_str, title)
-    if not info:
-        return None
-
+    cur_album = audio.get("album", [""])[0].strip()
+    cur_tot = audio.get("tracktotal", [""])[0].strip()
     changed = False
 
-    # 1. ALBUM
-    new_album = info.get("album", "").strip()
-    if new_album:
-        cur_album = audio.get("album", [""])[0].strip()
-        if info.get("is_single"):
-            # Если трек официально является синглом — фиксируем чистое имя сингла,
-            # перезаписывая любые кривые сборники (Tarifa Groove, Lezginka и т.д.)
-            if cur_album != new_album:
-                audio["album"] = [new_album]
-                changed = True
-        else:
-            # Для трека с полноформатного альбома (не сингла):
-            # Если тег альбома пустой — заполняем его найденным альбомом.
-            # Если же альбом равен названию трека (пользователь хранит релиз как сингл) —
-            # мы НЕ превращаем сингл насильно в альбомный трек!
-            if not cur_album:
-                audio["album"] = [new_album]
+    is_single = (
+        not cur_album
+        or cur_album.lower() in (title.lower(), "single", "unknown_release", "")
+        or "single" in cur_album.lower()
+        or cur_tot in ("1", "01", "")
+    )
+
+    if is_single:
+        # Для сингла альбом ВСЕГДА равен названию сингла
+        if title:
+            clean_alb = re.sub(r"(?i)\s*[\(\[](?:feat\.?|ft\.?|with|prod\.?|single).*?[\)\]]", "", title).strip()
+            clean_alb = re.sub(r"(?i)\s*-\s*single$", "", clean_alb).strip() or title
+            if cur_album != clean_alb:
+                audio["album"] = [clean_alb]
                 changed = True
 
-    # 2. ALBUMARTIST
-    new_aa = info.get("album_artist", "").strip()
-    if new_aa:
-        sanitizer = TagSanitizer()
-        canonical_aa = sanitizer.process_artists(new_aa)
-        if canonical_aa:
-            cur_aa = audio.get("albumartist", [])
-            if force or not cur_aa or cur_aa != canonical_aa:
-                audio["albumartist"] = canonical_aa
-                changed = True
-
-    # 3. TRACKNUMBER & TRACKTOTAL
-    cur_album = audio.get("album", [""])[0].strip()
-    if info.get("is_single") or cur_album.lower() == title.lower():
         if audio.get("tracknumber", [""])[0].strip() not in ("01", "1"):
             audio["tracknumber"] = ["01"]
             changed = True
         if audio.get("tracktotal", [""])[0].strip() != "1":
             audio["tracktotal"] = ["1"]
             changed = True
-    else:
-        num = info.get("track_number")
-        tot = info.get("track_total")
-        cur_num = audio.get("tracknumber", [""])[0].strip()
-        if num and (not cur_num or cur_num in ("0", "1", "01")):
-            audio["tracknumber"] = [str(num)]
-            changed = True
-        if tot:
-            audio["tracktotal"] = [str(tot)]
-            changed = True
-
-    # 4. DATE & ORIGINALDATE
-    rel_date = info.get("release_date", "").strip()
-    if rel_date:
-        year_4, full_d = extract_year_and_date(rel_date)
-        if year_4:
-            audio["date"] = [year_4]
-            audio["originaldate"] = [full_d]
-            changed = True
-
-    if "year" in audio:
-        del audio["year"]
-        changed = True
-
-    # 5. GENRE
-    cand_genre = info.get("genre", "")
-    if cand_genre:
-        existing_g = audio.get("genre", [])
-        if not existing_g:
-            parsed = parse_genres(cand_genre)
-            if parsed:
-                audio["genre"] = parsed
-                changed = True
 
     if changed:
         audio.save()
         log.info(
-            "Одиночный трек онлайн-привязан к альбому: %s — %s (AlbumArtist: %s, трек %s/%s)",
-            artist_str,
+            "Сингл оформлен: %s — %s (трек %s/%s)",
+            ", ".join(audio.get("artist", audio.get("albumartist", []))),
             audio.get("album", [""])[0],
-            audio.get("albumartist", [""])[0],
             audio.get("tracknumber", [""])[0],
             audio.get("tracktotal", [""])[0],
         )
 
-    return info
+    return {"is_single": is_single, "title": title}
+
+
+# Алиас для обратной совместимости
+enrich_single_track_release = ensure_single_track_metadata
 
 
 # ── Информация об альбоме ────────────────────────────────────────────────────
