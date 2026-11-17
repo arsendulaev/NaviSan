@@ -23,6 +23,13 @@ from enum import Enum, auto
 from pathlib import Path
 from dataclasses import dataclass, field, replace
 
+# Разрешаем полный доступ rw-rw-rw- (0666) и rwxrwxrwx (0777) для всех создаваемых файлов и папок,
+# чтобы исключить ошибки прав доступа между контейнерами, хостом и Navidrome.
+try:
+    os.umask(0o000)
+except Exception:
+    pass
+
 import requests
 from dotenv import load_dotenv
 from mutagen.flac import FLAC
@@ -665,8 +672,10 @@ def _run_full_pipeline(session: AlbumSession) -> tuple[list[str], Path]:
         report.append(f"📦 Перенесено в: `{library_folder.name}`")
 
     # 5. Чистим Inbox
-    cleanup_inbox(session.folder)
-    report.append(f"🗑️ {INBOX.name} очищен")
+    if cleanup_inbox(session.folder):
+        report.append(f"🗑️ {INBOX.name} очищен")
+    else:
+        report.append(f"⚠️ Папка в {INBOX.name} не удалена (ограничение прав на сервере)")
 
     return report, library_folder
 

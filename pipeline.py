@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 from collections import Counter
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -469,6 +470,15 @@ def count_flacs(folder: Path) -> int:
 
 # ── Staging: копирование ─────────────────────────────────────────────────────
 
+def _force_remove_readonly(func, path, exc_info):
+    """Снимает защиту от записи и повторяет операцию удаления."""
+    try:
+        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        func(path)
+    except Exception:
+        pass
+
+
 def copy_to_staging(src: Path, staging_root: Path) -> Path:
     """Копирует папку релиза из Inbox в Staging.
 
@@ -481,7 +491,10 @@ def copy_to_staging(src: Path, staging_root: Path) -> Path:
     dest = staging_root / src.name
     if dest.exists():
         log.info("Staging: удаляю старую копию %s", dest.name)
-        shutil.rmtree(dest)
+        try:
+            shutil.rmtree(dest, onexc=_force_remove_readonly)
+        except Exception as e:
+            log.warning("Не удалось удалить старую копию в Staging %s: %s", dest.name, e)
 
     staging_root.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dest)
@@ -705,27 +718,71 @@ def move_to_library(
         log.info("Library: найден существующий альбом '%s'. Запускаю слияние...", existing_dest.name)
         info = renamer.merge_folders(staging_folder, existing_dest, has_chosen_cover=has_chosen_cover)
         info["merged"] = True
-        return existing_dest, info
+        final_dest = existing_dest
+    else:
+        dest = library_root / staging_folder.name
+        shutil.move(str(staging_folder), str(dest))
+        log.info("Library: перенесено %s → %s", staging_folder.name, dest)
+        all_flacs = list(dest.rglob("*.flac"))
+        info = {
+            "merged": False,
+            "added_tracks": [f.name for f in all_flacs],
+            "updated_tracks": [],
+            "total_flacs": len(all_flacs),
+            "rg_ok": True,
+            "rg_msg": "OK",
+        }
+        final_dest = dest
 
-    dest = library_root / staging_folder.name
-    shutil.move(str(staging_folder), str(dest))
-    log.info("Library: перенесено %s → %s", staging_folder.name, dest)
-    all_flacs = list(dest.rglob("*.flac"))
-    return dest, {
-        "merged": False,
-        "added_tracks": [f.name for f in all_flacs],
-        "updated_tracks": [],
-        "total_flacs": len(all_flacs),
-        "rg_ok": True,
-        "rg_msg": "OK",
-    }
+    # Выставляем права rw-rw-rw- (0666) и rwxrwxrwx (0777) для файлов и папок в Library,
+    # чтобы Navidrome и любые другие сервисы могли их свободно читать и индексировать
+    for p in final_dest.rglob("*"):
+        try:
+            if p.is_dir():
+                os.chmod(p, 0o777)
+            else:
+                os.chmod(p, 0o666)
+        except Exception:
+            pass
+    try:
+        os.chmod(final_dest, 0o777)
+    except Exception:
+        pass
+
+    return final_dest, info
 
 
-def cleanup_inbox(inbox_folder: Path) -> None:
-    """Удаляет оригинальную папку из Inbox после успешного переноса в Library."""
-    if inbox_folder.exists():
-        shutil.rmtree(inbox_folder)
+def cleanup_inbox(inbox_folder: Path) -> bool:
+    """Удаляет оригинальную папку из Inbox после успешного переноса в Library.
+
+    Устойчива к ошибкам прав доступа:
+    - Снимает защиту от записи (chmod 0777) перед удалением.
+    - В случае ошибки прав на стороне хоста не прерывает pipeline (альбом уже сохранён).
+    """
+    if not inbox_folder.exists():
+        return True
+
+    try:
+        shutil.rmtree(inbox_folder, onexc=_force_remove_readonly)
         log.info("Inbox: удалено %s", inbox_folder.name)
+        return True
+    except Exception as exc:
+        log.warning("Не удалось автоматически удалить папку %s из Inbox (права доступа): %s", inbox_folder.name, exc)
+        for f in list(inbox_folder.rglob("*")):
+            try:
+                if f.is_file():
+                    try:
+                        os.chmod(f, 0o777)
+                    except Exception:
+                        pass
+                    f.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            inbox_folder.rmdir()
+            return True
+        except Exception:
+            return False
 
 
 # ── Хелперы ──────────────────────────────────────────────────────────────────
