@@ -275,22 +275,6 @@ def enrich_single_track_release(folder: Path, force: bool = False) -> dict | Non
     if not artist_str or not title:
         return None
 
-    # Проверяем, нужна ли онлайн-проверка:
-    # если не force, уже есть альбомный артист, альбом отличается от названия трека,
-    # не содержит "single" и трек-тотал > 2 — повторный сетевой запрос не нужен.
-    cur_aa = audio.get("albumartist", [])
-    cur_album = audio.get("album", [""])[0].strip()
-    cur_tot = int(audio.get("tracktotal", ["0"])[0] if audio.get("tracktotal", ["0"])[0].isdigit() else 0)
-    if (
-        not force
-        and len(cur_aa) >= 1
-        and cur_album
-        and cur_album.lower() != title.lower()
-        and "single" not in cur_album.lower()
-        and cur_tot > 2
-    ):
-        return None
-
     info = resolve_track_parent_album(artist_str, title)
     if not info:
         return None
@@ -302,13 +286,17 @@ def enrich_single_track_release(folder: Path, force: bool = False) -> dict | Non
     if new_album:
         cur_album = audio.get("album", [""])[0].strip()
         if info.get("is_single"):
-            # Сингл остается синглом с каноническим названием
-            if not cur_album or cur_album.lower() == title.lower() or "single" in cur_album.lower():
+            # Если трек официально является синглом — фиксируем чистое имя сингла,
+            # перезаписывая любые кривые сборники (Tarifa Groove, Lezginka и т.д.)
+            if cur_album != new_album:
                 audio["album"] = [new_album]
                 changed = True
         else:
-            # Для трека с полноформатного альбома (не сингла)
-            if not cur_album or cur_album.lower() == title.lower():
+            # Для трека с полноформатного альбома (не сингла):
+            # Если тег альбома пустой — заполняем его найденным альбомом.
+            # Если же альбом равен названию трека (пользователь хранит релиз как сингл) —
+            # мы НЕ превращаем сингл насильно в альбомный трек!
+            if not cur_album:
                 audio["album"] = [new_album]
                 changed = True
 
@@ -324,7 +312,8 @@ def enrich_single_track_release(folder: Path, force: bool = False) -> dict | Non
                 changed = True
 
     # 3. TRACKNUMBER & TRACKTOTAL
-    if info.get("is_single"):
+    cur_album = audio.get("album", [""])[0].strip()
+    if info.get("is_single") or cur_album.lower() == title.lower():
         if audio.get("tracknumber", [""])[0].strip() not in ("01", "1"):
             audio["tracknumber"] = ["01"]
             changed = True
