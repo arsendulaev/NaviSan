@@ -116,7 +116,22 @@ class FileSystemManager:
         best_album = Counter(album_names).most_common(1)[0][0] if album_names else "Unknown_Release"
 
         # 3. Определение артиста(ов) релиза
-        if force_common_artists and len(flac_files) >= 2 and track_artists_sets:
+        if len(flac_files) == 1:
+            try:
+                first_audio = FLAC(str(flac_files[0]))
+                t_arts = [a.strip() for a in first_audio.get("artist", []) if a.strip()]
+                aa_arts = [a.strip() for a in first_audio.get("albumartist", []) if a.strip()]
+                if t_arts and len(t_arts) >= len(aa_arts):
+                    final_artists = t_arts
+                elif aa_arts:
+                    final_artists = aa_arts
+                elif t_arts:
+                    final_artists = t_arts
+                else:
+                    final_artists = ["Unknown Artist"]
+            except Exception:
+                final_artists = ["Unknown Artist"]
+        elif force_common_artists and len(flac_files) >= 2 and track_artists_sets:
             common = set.intersection(*track_artists_sets)
             if common:
                 try:

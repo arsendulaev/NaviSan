@@ -291,6 +291,14 @@ def ensure_single_track_metadata(folder: Path, force: bool = False) -> dict | No
             audio["tracktotal"] = ["1"]
             changed = True
 
+        # Для сингла если у трека несколько исполнителей, гарантируем,
+        # что ALBUMARTIST не обрезает соавторов/коллабораторов
+        track_arts = [a.strip() for a in audio.get("artist", []) if a.strip()]
+        cur_aa = [a.strip() for a in audio.get("albumartist", []) if a.strip()]
+        if track_arts and (not cur_aa or len(track_arts) > len(cur_aa)):
+            audio["albumartist"] = track_arts
+            changed = True
+
     if changed:
         audio.save()
         log.info(
@@ -375,7 +383,12 @@ def album_info(folder: Path) -> tuple[str, str]:
     else:
         album_name = folder.name
 
-    if album_artists_list:
+    if len(flac_files) == 1 and first_track_artists and len(first_track_artists) >= len(album_artists_list[0] if album_artists_list else []):
+        if len(first_track_artists) == 2:
+            artist_str = " & ".join(first_track_artists)
+        else:
+            artist_str = ", ".join(first_track_artists)
+    elif album_artists_list:
         best_aa = list(Counter(album_artists_list).most_common(1)[0][0])
         if len(best_aa) == 2:
             artist_str = " & ".join(best_aa)
@@ -592,23 +605,11 @@ def find_existing_library_album(staging_folder: Path, library_root: Path) -> Pat
     Проверяет:
     1. Точное совпадение имени папки ('Artist - Album').
     2. Регистронезависимое совпадение имени папки.
-    3. Совпадение по тегам ARTIST и ALBUM.
+    3. Совпадение по артистам (как множества) и названию альбома.
     """
     if not library_root.exists():
         return None
 
-    # 1. Точное совпадение
-    exact = library_root / staging_folder.name
-    if exact.exists() and exact.is_dir():
-        return exact
-
-    # 2. Регистронезависимое совпадение
-    st_name_lower = staging_folder.name.lower()
-    for existing in library_root.iterdir():
-        if existing.is_dir() and existing.name.lower() == st_name_lower:
-            return existing
-
-    # 3. Совпадение по артистам (как множества) и названию альбома
     def _split_norm_artists(s: str) -> set[str]:
         parts = re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", s, flags=re.I)
         return {re.sub(r"[^\w]", "", p.lower()) for p in parts if re.sub(r"[^\w]", "", p.lower())}
@@ -616,6 +617,49 @@ def find_existing_library_album(staging_folder: Path, library_root: Path) -> Pat
     def _norm(s: str) -> str:
         return re.sub(r"[^\w]", "", (s or "").lower())
 
+    def _validate_merge_candidate(candidate: Path) -> bool:
+        """Защита от ошибочного слияния одиночных треков (синглов):
+        Если и в staging одиночный трек, и в найденной папке библиотеки лежит
+        одиночный трек, но у них разные исполнители или разные названия песен — слияние запрещено!
+        """
+        st_flacs = list(staging_folder.rglob("*.flac"))
+        ex_flacs = list(candidate.rglob("*.flac"))
+        if len(st_flacs) == 1 and len(ex_flacs) == 1:
+            try:
+                st_a = FLAC(str(st_flacs[0]))
+                ex_a = FLAC(str(ex_flacs[0]))
+
+                # Проверка состава исполнителей трека
+                st_arts = {re.sub(r"[^\w]", "", a.lower()) for a in st_a.get("artist", [])}
+                ex_arts = {re.sub(r"[^\w]", "", a.lower()) for a in ex_a.get("artist", [])}
+                if st_arts and ex_arts and st_arts != ex_arts:
+                    return False
+
+                # Проверка названий песен
+                st_t = _norm(st_a.get("title", [""])[0] or st_flacs[0].stem)
+                ex_t = _norm(ex_a.get("title", [""])[0] or ex_flacs[0].stem)
+                if st_t and ex_t:
+                    if st_t != ex_t:
+                        return False
+                    # Цифры обязаны совпадать (защита от Мысли вслух vs Мысли вслух 5)
+                    if re.findall(r"\d+", st_t) != re.findall(r"\d+", ex_t):
+                        return False
+            except Exception:
+                pass
+        return True
+
+    # 1. Точное совпадение
+    exact = library_root / staging_folder.name
+    if exact.exists() and exact.is_dir() and _validate_merge_candidate(exact):
+        return exact
+
+    # 2. Регистронезависимое совпадение
+    st_name_lower = staging_folder.name.lower()
+    for existing in library_root.iterdir():
+        if existing.is_dir() and existing.name.lower() == st_name_lower and _validate_merge_candidate(existing):
+            return existing
+
+    # 3. Совпадение по артистам (как множества) и названию альбома
     st_artist, st_album = album_info(staging_folder)
     if st_artist and st_album:
         st_arts_set = _split_norm_artists(st_artist)
@@ -629,7 +673,8 @@ def find_existing_library_album(staging_folder: Path, library_root: Path) -> Pat
                     continue
                 # Сравниваем точное нормализованное название альбома и состав артистов релиза
                 if _norm(ex_alb) == st_alb_norm and _split_norm_artists(ex_art) == st_arts_set:
-                    return existing
+                    if _validate_merge_candidate(existing):
+                        return existing
 
     return None
 
@@ -1491,11 +1536,12 @@ def enrich_album_online_metadata(folder: Path, force: bool = False, db_path: str
                     cur_aa = audio.get("albumartist", [])
                     should_update_aa = False
                     if force or not cur_aa:
-                        should_update_aa = True
-                    elif len(flac_files) == 1 and set(cur_aa) != set(canonical_aa):
-                        should_update_aa = True
-                    elif set(canonical_aa).issubset(set(cur_aa)) and len(cur_aa) > len(canonical_aa):
-                        should_update_aa = True
+                        # Для одиночного трека (сингла) онлайн-данные не должны урезать фиты/соавторов трека
+                        t_arts = [a.strip() for a in audio.get("artist", []) if a.strip()]
+                        if len(flac_files) == 1 and t_arts and len(t_arts) > len(canonical_aa):
+                            pass
+                        else:
+                            should_update_aa = True
                     elif set(cur_aa) == set(canonical_aa) and cur_aa != canonical_aa:
                         # Автоматически исправляем обратный/алфавитный порядок исполнителей на канонический
                         should_update_aa = True
