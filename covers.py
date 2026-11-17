@@ -418,6 +418,14 @@ def _raw_search_covers(
                         small_url = big_url + "-1200"
                     elif "front" in big_url and not any(k in big_url for k in ("-1200", "-500", "-250")):
                         small_url = big_url + "-1200"
+                    # Telegram Bot API не переходит по 307-редиректам coverartarchive.org.
+                    # Резолвим конечный прямой URL на archive.org заранее:
+                    try:
+                        r_mb = requests.head(small_url, allow_redirects=True, timeout=2.0)
+                        if r_mb.status_code == 200 and r_mb.url != small_url:
+                            small_url = r_mb.url
+                    except Exception:
+                        pass
 
                 info = obj.get("releaseInfo", {})
                 candidate = CoverCandidate(

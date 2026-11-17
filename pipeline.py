@@ -65,6 +65,19 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
     target_norm_t = _norm(cl_t)
     clean_target_arts = [_norm(a) for a in artist_tokens if len(_norm(a)) > 1]
 
+    def titles_match(t1: str, t2: str) -> bool:
+        n1, n2 = _norm(t1), _norm(t2)
+        if n1 == n2:
+            return True
+        # Цифры обязаны совпадать (защита от склеивания 'Мысли вслух' и 'Мысли вслух 5')
+        if re.findall(r"\d+", n1) != re.findall(r"\d+", n2):
+            return False
+        # Модификаторы версий обязаны совпадать (защита от склеивания оригинала и ремикса)
+        for mod in ("remix", "acoustic", "instrumental", "live", "edit", "demo", "slowed", "sped"):
+            if (mod in n1) != (mod in n2):
+                return False
+        return SequenceMatcher(None, n1, n2).ratio() >= 0.90
+
     # 1. Поиск в iTunes Search API
     for q in queries[:3]:
         for country in [None, "RU", "US"]:
@@ -82,24 +95,29 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
                     seen_ids.add(trk_id)
 
                     t_name = item.get("trackName", "")
-                    cand_norm_t = _norm(clean_track_title(t_name))
-                    if cand_norm_t != target_norm_t and SequenceMatcher(None, target_norm_t, cand_norm_t).ratio() < 0.85:
+                    cand_clean_t = clean_track_title(t_name)
+                    if not titles_match(cl_t, cand_clean_t):
                         continue
 
                     cand_art = item.get("artistName", "")
                     cand_coll_art = item.get("collectionArtistName") or cand_art
-                    combined_cand_art = _norm(cand_art + " " + cand_coll_art)
 
-                    # Отсекаем караоке, трибьюты, колыбельные
-                    if any(k in combined_cand_art or k in _norm(t_name) for k in ["karaoke", "tribute", "originallyperformed", "instrumentalversion", "lullaby"]):
-                        continue
-
-                    # Проверяем совпадение хотя бы одного артиста трека
-                    if not any(a in combined_cand_art for a in clean_target_arts):
+                    # Альбомный артист ОБЯЗАН совпадать с целевым исполнителем!
+                    # Защита от компиляций/сборников вроде 'Eden Ahbez... Tarifa Groove Collections 21'
+                    if not any(a in _norm(cand_coll_art) for a in clean_target_arts):
                         continue
 
                     coll_name = item.get("collectionName", "")
                     if not coll_name:
+                        continue
+
+                    # Отсекаем сборники хитов, компиляции, саундтреки, караоке
+                    coll_norm = _norm(coll_name)
+                    if any(k in coll_norm for k in [
+                        "karaoke", "tribute", "originallyperformed", "groovecollection",
+                        "compilation", "greatesthits", "bestof", "soundtrack", "ost",
+                        "highlights", "anthology", "playlist", "collection"
+                    ]):
                         continue
 
                     cnt = item.get("trackCount", 1)
@@ -121,8 +139,8 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
             except Exception as e:
                 log.debug("iTunes track lookup error: %s", e)
 
-    # 2. Deezer API (fallback для треков, не найденных в iTunes как полноформатный альбом)
-    if not any(not c["is_single"] for c in raw_candidates):
+    # 2. Deezer API (fallback для треков, не найденных в iTunes)
+    if not any(c["is_single"] for c in raw_candidates):
         for q in [f'track:"{cl_t}" artist:"{artist_tokens[0]}"', f"{artist_tokens[0]} {cl_t}"]:
             try:
                 r = httpx.get("https://api.deezer.com/search", params={"q": q}, headers=headers, timeout=5.0)
@@ -130,8 +148,8 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
                     continue
                 for d in r.json().get("data", []):
                     t_name = d.get("title", "")
-                    cand_norm_t = _norm(clean_track_title(t_name))
-                    if cand_norm_t != target_norm_t and SequenceMatcher(None, target_norm_t, cand_norm_t).ratio() < 0.85:
+                    cand_clean_t = clean_track_title(t_name)
+                    if not titles_match(cl_t, cand_clean_t):
                         continue
                     d_art = d.get("artist", {}).get("name", "")
                     if not any(a in _norm(d_art) for a in clean_target_arts):
@@ -152,16 +170,31 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
                                 aa = " & ".join(main_contribs)
                             else:
                                 aa = alb_r.get("artist", {}).get("name") or d_art
+
+                            # Альбомный артист ОБЯЗАН совпадать с целевым исполнителем!
+                            if not any(a in _norm(aa) for a in clean_target_arts):
+                                continue
+
+                            alb_title = alb_r.get("title") or d.get("album", {}).get("title", "")
+                            alb_norm = _norm(alb_title)
+                            # Отсекаем пиратские сборники (вроде 'Lezginka' на Deezer) и компиляции
+                            if any(k in alb_norm for k in [
+                                "karaoke", "tribute", "compilation", "greatesthits",
+                                "bestof", "lezginka", "playlist", "collection"
+                            ]):
+                                continue
+
+                            is_single = nb <= 2 or rec_type == "single" or "single" in alb_title.lower()
                             genres_raw = alb_r.get("genres", {}).get("data", [])
                             genre_cand = genres_raw[0].get("name", "") if genres_raw else ""
                             raw_candidates.append({
-                                "album": alb_r.get("title") or d.get("album", {}).get("title", ""),
+                                "album": alb_title,
                                 "album_artist": aa,
                                 "track_number": 1,
                                 "track_total": nb,
                                 "release_date": alb_r.get("release_date", ""),
                                 "genre": genre_cand,
-                                "is_single": nb <= 2 or rec_type == "single" or "single" in str(alb_r.get("title", "")).lower(),
+                                "is_single": is_single,
                             })
                         except Exception:
                             pass
@@ -171,12 +204,16 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
     if not raw_candidates:
         return None
 
-    albums = [c for c in raw_candidates if not c["is_single"]]
     singles = [c for c in raw_candidates if c["is_single"]]
+    albums = [c for c in raw_candidates if not c["is_single"]]
 
-    if albums:
-        # Сортировка альбомов: отсекаем сборники хитов, предпочитаем стандартное издание,
-        # совпадение с основным артистом и наиболее раннюю дату релиза
+    if singles:
+        # Трек выходил отдельным синглом — сохраняем статус сингла!
+        chosen = singles[0]
+        chosen["album"] = re.sub(r"(?i)\s*[\(\[](?:feat\.?|ft\.?|with|prod\.?|single).*?[\)\]]", "", chosen["album"])
+        chosen["album"] = re.sub(r"(?i)\s*-\s*single$", "", chosen["album"]).strip()
+    elif albums:
+        # Трек выходил ТОЛЬКО в составе полноформатного альбома/EP (например, альбомный трек с гостевым фитом)
         def album_sort_key(c: dict) -> tuple:
             name = c["album"].lower()
             is_comp = any(k in name for k in ["highlights", "greatest hits", "best of", "anthology", "collection", "playlist", "platinum", "gold"])
@@ -195,9 +232,7 @@ def resolve_track_parent_album(artist: str, title: str) -> dict | None:
             )
         chosen = sorted(albums, key=album_sort_key)[0]
     else:
-        chosen = singles[0]
-        chosen["album"] = re.sub(r"(?i)\s*[\(\[](?:feat\.?|ft\.?|with|prod\.?|single).*?[\)\]]", "", chosen["album"])
-        chosen["album"] = re.sub(r"(?i)\s*-\s*single$", "", chosen["album"]).strip()
+        return None
 
     return chosen
 
@@ -266,9 +301,16 @@ def enrich_single_track_release(folder: Path, force: bool = False) -> dict | Non
     new_album = info.get("album", "").strip()
     if new_album:
         cur_album = audio.get("album", [""])[0].strip()
-        if force or not cur_album or cur_album.lower() == title.lower() or "single" in cur_album.lower() or not info.get("is_single"):
-            audio["album"] = [new_album]
-            changed = True
+        if info.get("is_single"):
+            # Сингл остается синглом с каноническим названием
+            if not cur_album or cur_album.lower() == title.lower() or "single" in cur_album.lower():
+                audio["album"] = [new_album]
+                changed = True
+        else:
+            # Для трека с полноформатного альбома (не сингла)
+            if not cur_album or cur_album.lower() == title.lower():
+                audio["album"] = [new_album]
+                changed = True
 
     # 2. ALBUMARTIST
     new_aa = info.get("album_artist", "").strip()
@@ -282,15 +324,23 @@ def enrich_single_track_release(folder: Path, force: bool = False) -> dict | Non
                 changed = True
 
     # 3. TRACKNUMBER & TRACKTOTAL
-    num = info.get("track_number")
-    tot = info.get("track_total")
-    cur_num = audio.get("tracknumber", [""])[0].strip()
-    if num and (not cur_num or cur_num in ("0", "1", "01")):
-        audio["tracknumber"] = [str(num)]
-        changed = True
-    if tot:
-        audio["tracktotal"] = [str(tot)]
-        changed = True
+    if info.get("is_single"):
+        if audio.get("tracknumber", [""])[0].strip() not in ("01", "1"):
+            audio["tracknumber"] = ["01"]
+            changed = True
+        if audio.get("tracktotal", [""])[0].strip() != "1":
+            audio["tracktotal"] = ["1"]
+            changed = True
+    else:
+        num = info.get("track_number")
+        tot = info.get("track_total")
+        cur_num = audio.get("tracknumber", [""])[0].strip()
+        if num and (not cur_num or cur_num in ("0", "1", "01")):
+            audio["tracknumber"] = [str(num)]
+            changed = True
+        if tot:
+            audio["tracktotal"] = [str(tot)]
+            changed = True
 
     # 4. DATE & ORIGINALDATE
     rel_date = info.get("release_date", "").strip()
@@ -365,18 +415,6 @@ def album_info(folder: Path) -> tuple[str, str]:
         except Exception:
             continue
 
-    if len(flac_files) == 1 and not album_artists_list:
-        try:
-            enrich_single_track_release(folder)
-            audio = FLAC(str(flac_files[0]))
-            al = audio.get("album", [""])[0].strip()
-            if al:
-                album_names = [al]
-            aa = [a.strip() for a in audio.get("albumartist", []) if a.strip()]
-            if aa:
-                album_artists_list = [tuple(aa)]
-        except Exception:
-            pass
 
     folder_album_hint = ""
     folder_artist_hint = ""
@@ -629,20 +667,27 @@ def find_existing_library_album(staging_folder: Path, library_root: Path) -> Pat
         if existing.is_dir() and existing.name.lower() == st_name_lower:
             return existing
 
-    # 3. Совпадение по тегам ARTIST и ALBUM
+    # 3. Совпадение по артистам (как множества) и названию альбома
+    def _split_norm_artists(s: str) -> set[str]:
+        parts = re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", s, flags=re.I)
+        return {re.sub(r"[^\w]", "", p.lower()) for p in parts if re.sub(r"[^\w]", "", p.lower())}
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^\w]", "", (s or "").lower())
+
     st_artist, st_album = album_info(staging_folder)
     if st_artist and st_album:
-        norm_art = st_artist.lower().strip()
-        norm_alb = st_album.lower().strip()
-        expected_prefix = f"{norm_art} - {norm_alb}"
-
-        for existing in library_root.iterdir():
-            if not existing.is_dir():
-                continue
-            ex_name = existing.name.lower()
-            if ex_name.startswith(expected_prefix) or (norm_art in ex_name and norm_alb in ex_name):
+        st_arts_set = _split_norm_artists(st_artist)
+        st_alb_norm = _norm(st_album)
+        if st_arts_set and st_alb_norm:
+            for existing in library_root.iterdir():
+                if not existing.is_dir():
+                    continue
                 ex_art, ex_alb = album_info(existing)
-                if ex_art.lower().strip() == norm_art and ex_alb.lower().strip() == norm_alb:
+                if not ex_art or not ex_alb:
+                    continue
+                # Сравниваем точное нормализованное название альбома и состав артистов релиза
+                if _norm(ex_alb) == st_alb_norm and _split_norm_artists(ex_art) == st_arts_set:
                     return existing
 
     return None
@@ -1691,11 +1736,6 @@ def upgrade_album(
     cover_added = False
     lyrics_added = 0
 
-    if len(flac_files) == 1:
-        try:
-            enrich_single_track_release(album_dir, force=force)
-        except Exception as e:
-            log.warning("Ошибка enrich_single_track_release в upgrade_album: %s", e)
 
     # Шаг 1: Первым делом чистим и нормализуем метаданные во всех треках
     for flac in flac_files:

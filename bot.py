@@ -159,6 +159,21 @@ async def _send_native_slideshow(
     end_idx = min(start_idx + PAGE_SIZE, total_candidates)
     display = session.candidates[start_idx:end_idx]
 
+    # MusicBrainz coverartarchive.org использует 307-редиректы, которые Telegram отклоняет
+    # с ошибкой 'Failed to get http url content'. Резолвим прямой архивный URL заранее:
+    for i, c in enumerate(display):
+        if "coverartarchive.org" in c.small_url:
+            try:
+                r_mb = requests.head(c.small_url, allow_redirects=True, timeout=2.5)
+                if r_mb.status_code == 200 and r_mb.url != c.small_url:
+                    c_fixed = replace(c, small_url=r_mb.url)
+                    if c in session.candidates:
+                        idx = session.candidates.index(c)
+                        session.candidates[idx] = c_fixed
+                    display[i] = c_fixed
+            except Exception:
+                pass
+
     slideshow_blocks = []
     for i, c in enumerate(display):
         global_idx = start_idx + i
@@ -249,12 +264,15 @@ async def _send_native_slideshow(
         ):
             log.warning("sendRichMessage отклонен Telegram ('%s'). Выполняем автоисправление кандидатов страницы...", exc)
             # 1. Если Telegram отклонил запрос, исключаем сбойных кандидатов из session.candidates
+            # и обновляем URL редиректов на прямые
             valid_cands = []
             for c in session.candidates:
                 if c in display:
                     try:
-                        r = requests.get(c.small_url, timeout=2.0, headers={"User-Agent": "Mozilla/5.0"})
+                        r = requests.get(c.small_url, timeout=2.5, headers={"User-Agent": "Mozilla/5.0"})
                         if r.status_code == 200 and "image" in r.headers.get("content-type", "").lower():
+                            if r.url != c.small_url:
+                                c = replace(c, small_url=r.url)
                             valid_cands.append(c)
                         else:
                             log.warning("Исключена сбойная обложка [%s]: %s (status=%d, ctype=%s)", c.source, c.small_url, r.status_code, r.headers.get("content-type", ""))
@@ -263,10 +281,17 @@ async def _send_native_slideshow(
                 else:
                     valid_cands.append(c)
 
-            if len(valid_cands) < len(session.candidates) and valid_cands:
+            if valid_cands and (len(valid_cands) < len(session.candidates) or valid_cands != session.candidates):
                 session.candidates = valid_cands
-                log.info("Исключены сбойные кандидаты, осталось %d. Повторная отправка...", len(valid_cands))
+                log.info("Кандидаты обновлены/отфильтрованы, осталось %d. Повторная отправка...", len(valid_cands))
                 return await _send_native_slideshow(app, session)
+            elif len(display) > 1:
+                # Если URL формально валидны в requests, но Telegram всё равно не может их скачать —
+                # отсекаем первого кандидата страницы и пробуем снова
+                log.warning("Telegram отклонил URL. Исключаем кандидата [%s] %s...", display[0].source, display[0].small_url)
+                session.candidates = [c for c in session.candidates if c != display[0]]
+                if session.candidates:
+                    return await _send_native_slideshow(app, session)
         raise
 
 
