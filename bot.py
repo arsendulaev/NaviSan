@@ -175,7 +175,7 @@ async def _send_native_slideshow(
             "type": "photo",
             "photo": {
                 "type": "photo",
-                "media": c.big_url,
+                "media": c.small_url,
             },
             "caption": {
                 "text": slide_caption,
@@ -241,20 +241,25 @@ async def _send_native_slideshow(
         return res.get("message_id")
     except Exception as exc:
         err_str = str(exc).lower()
-        if "wrong type of the web page content" in err_str or "bad request" in err_str:
+        if (
+            "wrong type of the web page content" in err_str
+            or "bad request" in err_str
+            or "failed to get http url content" in err_str
+            or "wrong file identifier" in err_str
+        ):
             log.warning("sendRichMessage отклонен Telegram ('%s'). Выполняем автоисправление кандидатов страницы...", exc)
             # 1. Если Telegram отклонил запрос, исключаем сбойных кандидатов из session.candidates
             valid_cands = []
             for c in session.candidates:
                 if c in display:
                     try:
-                        r = requests.get(c.big_url, timeout=2.0, headers={"User-Agent": "Mozilla/5.0"})
+                        r = requests.get(c.small_url, timeout=2.0, headers={"User-Agent": "Mozilla/5.0"})
                         if r.status_code == 200 and "image" in r.headers.get("content-type", "").lower():
                             valid_cands.append(c)
                         else:
-                            log.warning("Исключена сбойная обложка [%s]: %s (status=%d, ctype=%s)", c.source, c.big_url, r.status_code, r.headers.get("content-type", ""))
+                            log.warning("Исключена сбойная обложка [%s]: %s (status=%d, ctype=%s)", c.source, c.small_url, r.status_code, r.headers.get("content-type", ""))
                     except Exception as test_exc:
-                        log.warning("Исключена сбойная обложка [%s]: %s (ошибка: %s)", c.source, c.big_url, test_exc)
+                        log.warning("Исключена сбойная обложка [%s]: %s (ошибка: %s)", c.source, c.small_url, test_exc)
                 else:
                     valid_cands.append(c)
 

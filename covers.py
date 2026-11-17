@@ -393,8 +393,6 @@ def _raw_search_covers(
 
             if msg_type == "cover":
                 big_url = obj.get("bigCoverUrl", "")
-                # Используем полноразмерный URL для лучшего качества и чёткости
-                small_url = big_url
                 if not big_url or big_url in seen_urls:
                     continue
 
@@ -405,6 +403,21 @@ def _raw_search_covers(
 
                 seen_urls.add(big_url)
                 src = obj.get("source", "unknown")
+
+                # Оптимальный preview URL для Telegram (small_url):
+                # Telegram выдает 'Failed to get http url content', если скачивает по URL
+                # файлы размером более 5-8 МБ (например, гигантские оригиналы Tidal origin.jpg
+                # или MusicBrainz front по 8-15 МБ).
+                # Поэтому для превью в Telegram используем чёткий 1200-1280px URL (<1 МБ),
+                # а для сохранения на диск в библиотеку (big_url) — полноценный 4000x4000 оригинал!
+                small_url = big_url
+                if src == "tidal" and "/origin.jpg" in big_url:
+                    small_url = big_url.replace("/origin.jpg", "/1280x1280.jpg")
+                elif src == "musicbrainz":
+                    if big_url.endswith("/front"):
+                        small_url = big_url + "-1200"
+                    elif "front" in big_url and not any(k in big_url for k in ("-1200", "-500", "-250")):
+                        small_url = big_url + "-1200"
 
                 info = obj.get("releaseInfo", {})
                 candidate = CoverCandidate(
