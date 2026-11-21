@@ -47,8 +47,6 @@ DEFAULT_SOURCES: tuple[str, ...] = (
     "deezer",
     "tidal",
     "amazonmusic",
-    "discogs",
-    "musicbrainz",
 )
 DEFAULT_COUNTRY = "us"
 
@@ -77,8 +75,8 @@ class CoverCandidate:
     их возвращают.
     """
 
-    small_url: str          # превью (совпадает с big_url для максимальной чёткости)
-    big_url: str            # полноразмерный оригинал — для сохранения cover.jpg
+    small_url: str          # превью ≤480 px — для Telegram MediaGroup
+    big_url: str            # полноразмерный оригинал — для вшивания в FLAC
     source: str             # amazonmusic | deezer | spotify | tidal
     title: str              # название релиза из источника
     artist: str             # имя артиста из источника
@@ -243,17 +241,10 @@ def _search_yandex_covers(
             timeout=(_CONNECT_TIMEOUT, _STREAM_TIMEOUT),
         )
         if resp.status_code == 451:
-            if token:
-                log.warning(
-                    "Yandex Music API вернул 451 (геоблокировка). "
-                    "Токен указан, но на этом аккаунте Яндекса нет активной подписки Яндекс Плюс. "
-                    "Для запросов с зарубежных IP Яндекс требует аккаунт с активным Плюсом."
-                )
-            else:
-                log.warning(
-                    "Yandex Music API вернул 451 (геоблокировка). "
-                    "Запрос отклонён Яндексом! Укажите YANDEX_MUSIC_TOKEN (с активным Яндекс Плюс) в .env для работы из-за рубежа."
-                )
+            log.warning(
+                "Yandex Music API вернул 451 (геоблокировка). "
+                "Запрос отклонён Яндексом! Укажите YANDEX_MUSIC_TOKEN в .env для работы из-за рубежа."
+            )
             raise YandexGeoblockError()
         if resp.status_code == 401:
             log.warning("Yandex Music API: 401 Unauthorized (проверьте YANDEX_MUSIC_TOKEN в .env)")
@@ -281,7 +272,7 @@ def _search_yandex_covers(
         seen_uris.add(cover_uri)
 
         big_url = _build_yandex_cover_url(cover_uri, "m1000x1000")
-        small_url = big_url
+        small_url = _build_yandex_cover_url(cover_uri, "400x400")
 
         alb_artists: list[str] = []
         for a in alb.get("artists", []):
@@ -393,39 +384,23 @@ def _raw_search_covers(
 
             if msg_type == "cover":
                 big_url = obj.get("bigCoverUrl", "")
+                small_url = obj.get("smallCoverUrl", "") or big_url
                 if not big_url or big_url in seen_urls:
                     continue
 
                 # Исключаем видео-обложки (Tidal .mp4 и др.), так как они не являются изображениями
-                if any(ext in big_url.lower() for ext in (".mp4", ".m4v", ".webm", ".mov", "/videos/")):
+                if any(ext in big_url.lower() or ext in small_url.lower() for ext in (".mp4", ".m4v", ".webm", ".mov", "/videos/")):
                     log.debug("  Пропущена видео-обложка: %s", big_url)
                     continue
 
                 seen_urls.add(big_url)
                 src = obj.get("source", "unknown")
 
-                # Оптимальный preview URL для Telegram (small_url):
-                # Telegram выдает 'Failed to get http url content', если скачивает по URL
-                # файлы размером более 5-8 МБ (например, гигантские оригиналы Tidal origin.jpg
-                # или MusicBrainz front по 8-15 МБ).
-                # Поэтому для превью в Telegram используем чёткий 1200-1280px URL (<1 МБ),
-                # а для сохранения на диск в библиотеку (big_url) — полноценный 4000x4000 оригинал!
-                small_url = big_url
-                if src == "tidal" and "/origin.jpg" in big_url:
-                    small_url = big_url.replace("/origin.jpg", "/1280x1280.jpg")
-                elif src == "musicbrainz":
-                    if big_url.endswith("/front"):
-                        small_url = big_url + "-1200"
-                    elif "front" in big_url and not any(k in big_url for k in ("-1200", "-500", "-250")):
-                        small_url = big_url + "-1200"
-                    # Telegram Bot API не переходит по 307-редиректам coverartarchive.org.
-                    # Резолвим конечный прямой URL на archive.org заранее:
-                    try:
-                        r_mb = requests.head(small_url, allow_redirects=True, timeout=2.0)
-                        if r_mb.status_code == 200 and r_mb.url != small_url:
-                            small_url = r_mb.url
-                    except Exception:
-                        pass
+                # Для Spotify smallCoverUrl генерируется со вторичным хешем b273,
+                # который CDN Akamai периодически блокирует или отдаёт 404 серверам Telegram.
+                # bigCoverUrl у Spotify всегда отдаётся стабильно.
+                if src == "spotify" and "i.scdn.co/image/" in big_url:
+                    small_url = big_url
 
                 info = obj.get("releaseInfo", {})
                 candidate = CoverCandidate(

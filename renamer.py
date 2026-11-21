@@ -116,34 +116,13 @@ class FileSystemManager:
         best_album = Counter(album_names).most_common(1)[0][0] if album_names else "Unknown_Release"
 
         # 3. Определение артиста(ов) релиза
-        if len(flac_files) == 1:
-            try:
-                first_audio = FLAC(str(flac_files[0]))
-                t_arts = [a.strip() for a in first_audio.get("artist", []) if a.strip()]
-                aa_arts = [a.strip() for a in first_audio.get("albumartist", []) if a.strip()]
-                if t_arts and len(t_arts) >= len(aa_arts):
-                    final_artists = t_arts
-                elif aa_arts:
-                    final_artists = aa_arts
-                elif t_arts:
-                    final_artists = t_arts
-                else:
-                    final_artists = ["Unknown Artist"]
-            except Exception:
-                final_artists = ["Unknown Artist"]
-        elif force_common_artists and len(flac_files) >= 2 and track_artists_sets:
+        if force_common_artists and len(flac_files) >= 2 and track_artists_sets:
             common = set.intersection(*track_artists_sets)
             if common:
-                try:
-                    first_track_artists = FLAC(str(flac_files[0])).get("artist", [])
-                    final_artists = [art for art in first_track_artists if art in common]
-                    if not final_artists:
-                        final_artists = list(common)
-                except Exception:
-                    final_artists = list(common)
+                final_artists = sorted(common, key=lambda s: s.casefold())
             elif album_artists_list:
                 best_aa = Counter(album_artists_list).most_common(1)[0][0]
-                final_artists = list(best_aa)
+                final_artists = sorted(best_aa, key=lambda s: s.casefold())
             else:
                 final_artists = ["Various Artists"]
         elif album_artists_list:
@@ -290,21 +269,16 @@ class FileSystemManager:
                 dst_cover = cp
                 break
 
-        if dst_cover:
-            try:
-                from surgeon import FLACSurgeon
-                surgeon = FLACSurgeon()
-                target_list = list(dst.rglob("*.flac")) if has_chosen_cover else added_tracks
-                for tr in target_list:
-                    if tr.exists():
-                        try:
-                            audio = FLAC(str(tr))
-                            if not audio.pictures or has_chosen_cover:
-                                surgeon.heal_file(str(tr), force_update=has_chosen_cover)
-                        except Exception as e:
-                            log.debug("Не удалось синхронизировать обложку в %s: %s", tr.name, e)
-            except Exception as e:
-                log.warning("Ошибка при вшивании обложки после слияния: %s", e)
+        # 3. Очистка встроенных обложек в добавленных треках (обложка хранится в cover.jpg)
+        for tr in added_tracks:
+            if tr.exists():
+                try:
+                    audio = FLAC(str(tr))
+                    if audio.pictures:
+                        audio.clear_pictures()
+                        audio.save()
+                except Exception as e:
+                    log.debug("Не удалось очистить встроенную обложку в %s: %s", tr.name, e)
 
         # 4. Пересчёт / удаление ReplayGain для объединённого релиза
         rg_ok = False
