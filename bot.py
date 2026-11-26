@@ -133,6 +133,16 @@ def _resolve_album_cb_token(raw_value: str, bot_data: dict | None = None) -> str
                 return d.name
     return raw_value
 
+
+def escape_tg_md(text: str) -> str:
+    """Экранирует специальные символы Telegram Markdown (v1): *, _, `, [."""
+    if not text:
+        return ""
+    text = str(text).replace("\\", "\\\\")
+    for char in ("*", "_", "`", "["):
+        text = text.replace(char, f"\\{char}")
+    return text
+
 INBOX: Path = Path(os.environ.get("NAVISAN_INBOX", "/inbox"))
 STAGING: Path = Path(os.environ.get("NAVISAN_STAGING", "/staging"))
 LIBRARY: Path = Path(os.environ.get("NAVISAN_LIBRARY", "/library"))
@@ -1193,20 +1203,39 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await _safe_edit_message(query, final_text, reply_markup=InlineKeyboardMarkup(final_kb))
 
 
-async def _safe_edit_message(query, text: str, reply_markup=None, parse_mode="Markdown") -> None:
-    """Редактирует сообщение, безопасно игнорируя 'Message is not modified' и обрабатывая ограничения Telegram."""
+async def _safe_edit_message(target, text: str, reply_markup=None, parse_mode: str | None = "Markdown") -> None:
+    """Редактирует сообщение (через CallbackQuery или Message), безопасно обрабатывая ограничения Telegram."""
     from telegram.error import RetryAfter
+    edit_func = getattr(target, "edit_message_text", None) or getattr(target, "edit_text", None)
+    if not edit_func:
+        return
+
     try:
-        await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        await edit_func(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     except BadRequest as e:
-        if "Message is not modified" in str(e):
+        err_msg = str(e)
+        if "Message is not modified" in err_msg:
             pass
+        elif "Can't parse entities" in err_msg and parse_mode is not None:
+            log.warning("Ошибка парсинга Markdown в Telegram (%s), повторяем без разметки", e)
+            try:
+                await edit_func(text=text, parse_mode=None, reply_markup=reply_markup)
+            except Exception as e2:
+                log.warning("Ошибка fallback-редактирования без разметки: %s", e2)
         else:
             log.warning("BadRequest при редактировании сообщения: %s", e)
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.5)
         try:
-            await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+            await edit_func(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except BadRequest as e2:
+            if "Can't parse entities" in str(e2) and parse_mode is not None:
+                try:
+                    await edit_func(text=text, parse_mode=None, reply_markup=reply_markup)
+                except Exception:
+                    pass
+            elif "Message is not modified" not in str(e2):
+                log.warning("Ошибка повторного редактирования сообщения: %s", e2)
         except Exception as e2:
             log.warning("Ошибка повторного редактирования сообщения: %s", e2)
     except TelegramError as e:
@@ -1437,7 +1466,7 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
         ctx.bot_data["lyrics_audit_data"] = audit_data
         text, keyboard = _render_lyrics_audit_view(audit_data)
-        await status_msg.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit_message(status_msg, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     all_albums = sorted([
@@ -2296,21 +2325,24 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     st = info.get("status")
 
     if st == "error":
-        err = info.get("error", "Неизвестная ошибка")
-        await status_msg.edit_text(f"❌ *Ошибка при проверке обновлений:*\n`{err}`", parse_mode="Markdown")
+        err = escape_tg_md(info.get("error", "Неизвестная ошибка"))
+        await _safe_edit_message(status_msg, f"❌ *Ошибка при проверке обновлений:*\n`{err}`")
         delete_later(ctx.bot, OWNER_ID, status_msg.message_id, delay=8.0)
         delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=8.0)
         return
 
     if st == "up_to_date":
         cur = info.get("current", {})
+        cur_msg = escape_tg_md(cur.get("message", ""))
+        cur_short = escape_tg_md(cur.get("short", "unknown"))
+        cur_date = escape_tg_md(cur.get("date", ""))
         txt = (
             "✨ *Установлена самая актуальная версия NaviSan!*\n\n"
-            f"🔖 Текущий коммит: `{cur.get('short', 'unknown')}`\n"
-            f"📅 Дата: {cur.get('date', '')}\n"
-            f"📝 _{cur.get('message', '')}_"
+            f"🔖 Текущий коммит: `{cur_short}`\n"
+            f"📅 Дата: {cur_date}\n"
+            f"📝 _{cur_msg}_"
         )
-        await status_msg.edit_text(txt, parse_mode="Markdown")
+        await _safe_edit_message(status_msg, txt)
         delete_later(ctx.bot, OWNER_ID, status_msg.message_id, delay=7.0)
         delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=7.0)
         return
@@ -2322,7 +2354,8 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cnt = info.get("count", len(commits))
         reqs = info.get("reqs_changed", False)
 
-        commits_preview = "\n".join(f"• `{c}`" for c in commits[:8])
+        safe_commits = [c.replace("`", "'") for c in commits[:8]]
+        commits_preview = "\n".join(f"• `{c}`" for c in safe_commits)
         if len(commits) > 8:
             commits_preview += f"\n_...и ещё {len(commits) - 8} коммитов_"
 
@@ -2339,7 +2372,7 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             [InlineKeyboardButton("🚀 Обновить и перезапустить", callback_data="update:confirm")],
             [InlineKeyboardButton("❌ Отмена", callback_data="update:cancel")],
         ]
-        await status_msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await _safe_edit_message(status_msg, txt, reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def on_update_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3320,8 +3353,11 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Глобальный обработчик ошибок Telegram."""
     err = context.error
-    if isinstance(err, BadRequest) and "Query is too old" in str(err):
-        log.debug("Игнорируем устаревший callback query: %s", err)
+    if isinstance(err, BadRequest):
+        if "Query is too old" in str(err):
+            log.debug("Игнорируем устаревший callback query: %s", err)
+            return
+        log.warning("Telegram BadRequest: %s", err)
         return
     if isinstance(err, (NetworkError, TimedOut)):
         log.warning("Временный сетевой сбой Telegram API (%s): %s", type(err).__name__, err)
@@ -3363,7 +3399,8 @@ async def auto_update_checker(app: Application) -> None:
                     cnt = info.get("count", len(commits))
                     reqs = info.get("reqs_changed", False)
 
-                    commits_preview = "\n".join(f"• `{c}`" for c in commits[:5])
+                    safe_commits = [c.replace("`", "'") for c in commits[:5]]
+                    commits_preview = "\n".join(f"• `{c}`" for c in safe_commits)
                     if len(commits) > 5:
                         commits_preview += f"\n_...и ещё {len(commits) - 5} коммитов_"
 
@@ -3380,12 +3417,23 @@ async def auto_update_checker(app: Application) -> None:
                         [InlineKeyboardButton("🚀 Обновить и перезапустить", callback_data="update:confirm")],
                         [InlineKeyboardButton("⏱️ Напомнить позже", callback_data="update:snooze")],
                     ]
-                    await app.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=txt,
-                        reply_markup=InlineKeyboardMarkup(kb),
-                        parse_mode="Markdown",
-                    )
+                    try:
+                        await app.bot.send_message(
+                            chat_id=OWNER_ID,
+                            text=txt,
+                            reply_markup=InlineKeyboardMarkup(kb),
+                            parse_mode="Markdown",
+                        )
+                    except BadRequest as e:
+                        if "Can't parse entities" in str(e):
+                            await app.bot.send_message(
+                                chat_id=OWNER_ID,
+                                text=txt,
+                                reply_markup=InlineKeyboardMarkup(kb),
+                                parse_mode=None,
+                            )
+                        else:
+                            raise
                     settings["last_notified_update_sha"] = target_sha
                     settings["last_notified_update_time"] = now
                     settings["update_snooze_until"] = now + 24 * 3600
@@ -3436,8 +3484,8 @@ async def post_init(app: Application) -> None:
         if marker:
             was_updated = True
             new_com = marker.get("new_commit", {})
-            sha = new_com.get("short", "unknown")
-            title = new_com.get("message", "")
+            sha = escape_tg_md(new_com.get("short", "unknown"))
+            title = escape_tg_md(new_com.get("message", ""))
             req_warn = (
                 "\n\n⚠️ _Внимание: в обновлении изменился requirements.txt. "
                 "Если новым функциям нужны пакеты, выполните на сервере:_ `docker compose build`"
@@ -3460,11 +3508,28 @@ async def post_init(app: Application) -> None:
                     )
                     delete_later(app.bot, orig_chat_id, orig_msg_id, delay=8.0)
                 except Exception:
+                    try:
+                        await app.bot.edit_message_text(
+                            chat_id=orig_chat_id,
+                            message_id=orig_msg_id,
+                            text=upd_text,
+                            parse_mode=None,
+                        )
+                        delete_later(app.bot, orig_chat_id, orig_msg_id, delay=8.0)
+                    except Exception:
+                        try:
+                            msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
+                            delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
+                        except Exception:
+                            msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode=None)
+                            delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
+            else:
+                try:
                     msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
                     delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
-            else:
-                msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode="Markdown")
-                delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
+                except Exception:
+                    msg = await app.bot.send_message(chat_id=OWNER_ID, text=upd_text, parse_mode=None)
+                    delete_later(app.bot, OWNER_ID, msg.message_id, delay=8.0)
     except Exception as e:
         log.warning("Ошибка обработки маркера обновления в post_init: %s", e)
 
