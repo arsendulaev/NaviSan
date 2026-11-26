@@ -16,12 +16,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
 from enum import Enum, auto
 from pathlib import Path
 from dataclasses import dataclass, field, replace
+
+# Разрешаем полный доступ rw-rw-rw- (0666) и rwxrwxrwx (0777) для всех создаваемых файлов и папок,
+# чтобы исключить ошибки прав доступа между контейнерами, хостом, FileBrowser и Navidrome.
+try:
+    os.umask(0o000)
+except Exception:
+    pass
 
 import requests
 from dotenv import load_dotenv
@@ -94,6 +102,36 @@ def delete_later(bot, chat_id: int, message_id: int, delay: float = 4.0) -> None
             pass
 
     asyncio.create_task(_worker())
+
+
+_TOKEN_CACHE: dict[str, str] = {}  # module-level fallback для pure-function контекстов
+
+
+def _album_cb_token(album_name: str, bot_data: dict | None = None) -> str:
+    """Возвращает короткий 12-символьный токен папки для callback_data (<= 64 байт)."""
+    token = hashlib.sha1(album_name.encode("utf-8")).hexdigest()[:12]
+    _TOKEN_CACHE[token] = album_name
+    if bot_data is not None:
+        bot_data.setdefault("album_cb_tokens", {})[token] = album_name
+    return token
+
+
+def _resolve_album_cb_token(raw_value: str, bot_data: dict | None = None) -> str:
+    """Восстанавливает имя папки альбома по токену (или возвращает как есть для старых кнопок)."""
+    if raw_value in _TOKEN_CACHE:
+        return _TOKEN_CACHE[raw_value]
+    if bot_data is not None:
+        tokens = bot_data.get("album_cb_tokens", {})
+        if raw_value in tokens:
+            return tokens[raw_value]
+    if len(raw_value) == 12 and all(c in "0123456789abcdef" for c in raw_value) and LIBRARY.exists():
+        for d in LIBRARY.iterdir():
+            if d.is_dir() and hashlib.sha1(d.name.encode("utf-8")).hexdigest()[:12] == raw_value:
+                _TOKEN_CACHE[raw_value] = d.name
+                if bot_data is not None:
+                    bot_data.setdefault("album_cb_tokens", {})[raw_value] = d.name
+                return d.name
+    return raw_value
 
 INBOX: Path = Path(os.environ.get("NAVISAN_INBOX", "/inbox"))
 STAGING: Path = Path(os.environ.get("NAVISAN_STAGING", "/staging"))
@@ -530,10 +568,11 @@ async def _execute_pipeline_and_report(status_msg, ctx_or_app, session: AlbumSes
     if bot_data is not None:
         bot_data[f"release_report_{library_folder.name}"] = final_text
 
+    alb_tok = _album_cb_token(library_folder.name, bot_data)
     keyboard = [
         [
-            InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{library_folder.name}"),
-            InlineKeyboardButton("👤 Настроить артистов", callback_data=f"artist:album:{library_folder.name}"),
+            InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{alb_tok}"),
+            InlineKeyboardButton("👤 Настроить артистов", callback_data=f"artist:album:{alb_tok}"),
         ],
         [
             InlineKeyboardButton("❌ Закрыть", callback_data="report:close"),
@@ -548,13 +587,27 @@ async def _execute_pipeline_and_report(status_msg, ctx_or_app, session: AlbumSes
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-    except Exception:
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=final_text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+    except Exception as exc:
+        log.warning("Не удалось отредактировать статус-сообщение отчёта (%s), отправляю новым...", exc)
+        try:
+            await bot.send_message(
+                chat_id=OWNER_ID,
+                text=final_text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            try:
+                await bot.delete_message(chat_id=OWNER_ID, message_id=status_msg.message_id)
+            except Exception:
+                pass
+        except Exception as exc2:
+            log.error("Ошибка отправки финального отчёта (%s), fallback без разметки", exc2)
+            await bot.edit_message_text(
+                chat_id=OWNER_ID,
+                message_id=status_msg.message_id,
+                text=final_text.replace("*", "").replace("`", ""),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
 
 
 async def on_report_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -572,7 +625,8 @@ async def on_report_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if query.data.startswith("report:show:"):
-        album_name = query.data[len("report:show:"):]
+        raw_arg = query.data[len("report:show:"):]
+        album_name = _resolve_album_cb_token(raw_arg, ctx.bot_data)
         album_dir = LIBRARY / album_name
         if not album_dir.exists():
             matches = [d for d in LIBRARY.iterdir() if d.is_dir() and album_name.lower() in d.name.lower()]
@@ -594,10 +648,11 @@ async def on_report_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     report_text = re.sub(r"💿 \*.*?\*\n👤 \*Исполнитель релиза:\* `.*?`", new_header, report_text)
                     ctx.bot_data[f"release_report_{album_name}"] = report_text
 
+        alb_tok = _album_cb_token(album_name, ctx.bot_data)
         keyboard = [
             [
-                InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{album_name}"),
-                InlineKeyboardButton("👤 Настроить артистов", callback_data=f"artist:album:{album_name}"),
+                InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{alb_tok}"),
+                InlineKeyboardButton("👤 Настроить артистов", callback_data=f"artist:album:{alb_tok}"),
             ],
             [
                 InlineKeyboardButton("❌ Закрыть", callback_data="report:close"),
@@ -652,8 +707,10 @@ def _run_full_pipeline(session: AlbumSession) -> tuple[list[str], Path]:
         report.append(f"📦 Перенесено в: `{library_folder.name}`")
 
     # 5. Чистим Inbox
-    cleanup_inbox(session.folder)
-    report.append(f"🗑️ {INBOX.name} очищен")
+    if cleanup_inbox(session.folder):
+        report.append(f"🗑️ {INBOX.name} очищен")
+    else:
+        report.append(f"⚠️ Папка в {INBOX.name} не удалена (ограничение прав на сервере)")
 
     return report, library_folder
 
@@ -1226,7 +1283,7 @@ def _render_album_lyrics_tracklist(
 
     if from_report:
         keyboard.append([
-            InlineKeyboardButton("⬅️ Назад к релизу", callback_data=f"report:show:{album_dir.name}")
+            InlineKeyboardButton("⬅️ Назад к релизу", callback_data=f"report:show:{_album_cb_token(album_dir.name)}")
         ])
     else:
         keyboard.append([
@@ -1487,7 +1544,7 @@ def _render_album_artists_view(
         keyboard.append(buttons[row_start : row_start + 5])
 
     if from_report:
-        keyboard.append([InlineKeyboardButton("⬅️ Назад к релизу", callback_data=f"report:show:{album_dir.name}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад к релизу", callback_data=f"report:show:{_album_cb_token(album_dir.name)}")])
     else:
         keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
     return "\n".join(lines), keyboard
@@ -1748,7 +1805,7 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "album":
         await query.answer()
-        album_name = ":".join(parts[2:])
+        album_name = _resolve_album_cb_token(":".join(parts[2:]), ctx.bot_data)
         album_dir = LIBRARY / album_name
         if not album_dir.exists():
             matches = [d for d in LIBRARY.iterdir() if d.is_dir() and d.name.lower() == album_name.lower()]
@@ -2414,7 +2471,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if action == "album":
-        album_name = parts[2]
+        album_name = _resolve_album_cb_token(":".join(parts[2:]), ctx.bot_data)
         album_dir = LIBRARY / album_name
         if not album_dir.exists():
             matches = [d for d in LIBRARY.iterdir() if d.is_dir() and album_name.lower() in d.name.lower()]

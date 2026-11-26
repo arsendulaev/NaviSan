@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 from collections import Counter
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -472,6 +473,33 @@ def count_flacs(folder: Path) -> int:
 
 # ── Staging: копирование ─────────────────────────────────────────────────────
 
+def _force_remove_readonly(func, path, exc_info):
+    """Снимает защиту от записи и повторяет операцию удаления."""
+    try:
+        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        func(path)
+    except Exception:
+        pass
+
+
+def ensure_open_permissions(target: Path, uid: int = 1000, gid: int = 1000) -> None:
+    """Выставляет владельца 1000:1000 (при работе от root) и права 0777/0666,
+    чтобы FileBrowser, Navidrome и Puddletag имели полный доступ к файлам.
+    """
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    items = [target, *target.rglob("*")] if target.is_dir() else [target]
+    for p in items:
+        try:
+            if is_root and hasattr(os, "chown"):
+                os.chown(p, uid, gid)
+        except Exception:
+            pass
+        try:
+            os.chmod(p, 0o777 if p.is_dir() else 0o666)
+        except Exception:
+            pass
+
+
 def copy_to_staging(src: Path, staging_root: Path) -> Path:
     """Копирует папку релиза из Inbox в Staging.
 
@@ -484,7 +512,12 @@ def copy_to_staging(src: Path, staging_root: Path) -> Path:
     dest = staging_root / src.name
     if dest.exists():
         log.info("Staging: удаляю старую копию %s", dest.name)
-        shutil.rmtree(dest)
+        try:
+            shutil.rmtree(dest, onexc=_force_remove_readonly)
+        except TypeError:
+            shutil.rmtree(dest, onerror=_force_remove_readonly)
+        except Exception as e:
+            log.warning("Не удалось удалить старую копию в Staging %s: %s", dest.name, e)
 
     staging_root.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dest)
@@ -539,6 +572,8 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
             audio.save()
         except Exception as e:
             log.warning("Не удалось обновить обложку в %s: %s", f.name, e)
+
+    ensure_open_permissions(folder)
 
     res_note = f" ({cover.resolution_str})" if cover.resolution_str else ""
     return f"🖼️ Обложка [{cover.source}]{res_note} успешно сохранена в cover.jpg"
@@ -701,27 +736,53 @@ def move_to_library(
         log.info("Library: найден существующий альбом '%s'. Запускаю слияние...", existing_dest.name)
         info = renamer.merge_folders(staging_folder, existing_dest, has_chosen_cover=has_chosen_cover)
         info["merged"] = True
-        return existing_dest, info
+        final_dest = existing_dest
+    else:
+        dest = library_root / staging_folder.name
+        shutil.move(str(staging_folder), str(dest))
+        log.info("Library: перенесено %s → %s", staging_folder.name, dest)
+        all_flacs = list(dest.rglob("*.flac"))
+        info = {
+            "merged": False,
+            "added_tracks": [f.name for f in all_flacs],
+            "updated_tracks": [],
+            "total_flacs": len(all_flacs),
+            "rg_ok": True,
+            "rg_msg": "OK",
+        }
+        final_dest = dest
 
-    dest = library_root / staging_folder.name
-    shutil.move(str(staging_folder), str(dest))
-    log.info("Library: перенесено %s → %s", staging_folder.name, dest)
-    all_flacs = list(dest.rglob("*.flac"))
-    return dest, {
-        "merged": False,
-        "added_tracks": [f.name for f in all_flacs],
-        "updated_tracks": [],
-        "total_flacs": len(all_flacs),
-        "rg_ok": True,
-        "rg_msg": "OK",
-    }
+    ensure_open_permissions(final_dest)
+    return final_dest, info
 
 
-def cleanup_inbox(inbox_folder: Path) -> None:
-    """Удаляет оригинальную папку из Inbox после успешного переноса в Library."""
-    if inbox_folder.exists():
-        shutil.rmtree(inbox_folder)
+def cleanup_inbox(inbox_folder: Path) -> bool:
+    """Удаляет оригинальную папку из Inbox после успешного переноса в Library.
+
+    Устойчива к ошибкам прав доступа: снимает защиту от записи перед удалением
+    и не прерывает pipeline, если удаление ограничено правами хоста.
+    """
+    if not inbox_folder.exists():
+        return True
+
+    try:
+        shutil.rmtree(inbox_folder, onexc=_force_remove_readonly)
+    except TypeError:
+        try:
+            shutil.rmtree(inbox_folder, onerror=_force_remove_readonly)
+        except Exception as e:
+            log.warning("Inbox: не удалось полностью удалить %s: %s", inbox_folder.name, e)
+            return False
+    except Exception as e:
+        log.warning("Inbox: не удалось полностью удалить %s: %s", inbox_folder.name, e)
+        return False
+
+    if not inbox_folder.exists():
         log.info("Inbox: удалено %s", inbox_folder.name)
+        return True
+
+    log.warning("Inbox: папка %s осталась на диске из-за ограничений прав доступа", inbox_folder.name)
+    return False
 
 
 # ── Хелперы ──────────────────────────────────────────────────────────────────
@@ -1707,6 +1768,8 @@ def upgrade_album(
         if force_replaygain or not album_has_replaygain(new_folder):
             rg_ok, _ = apply_replaygain(new_folder)
             replaygain_added = rg_ok
+
+    ensure_open_permissions(new_folder)
 
     return {
         "old_folder": album_dir.name,
